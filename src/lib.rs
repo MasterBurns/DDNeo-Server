@@ -12,8 +12,8 @@ pub const DEFAULT_SERVER_PORT: u16 = 27777;
 pub const LAN_DISCOVERY_PORT: u16 = 27778;
 pub const DEFAULT_EMBEDDED_MAX_PLAYERS: u8 = 4;
 pub const DEFAULT_DEDICATED_MAX_PLAYERS: u8 = 12;
-pub const PROTOCOL_VERSION: u32 = 4;
-pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V4";
+pub const PROTOCOL_VERSION: u32 = 5;
+pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V5";
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 const LOCAL_INTEREST_RADIUS_M: f64 = 1_850.0;
@@ -307,6 +307,7 @@ pub enum NetClientMsg {
         role_id: u8,
         appearance_bytes: [u8; 24],
         net_pos: NetWorldPos,
+        reset_character: bool,
     },
     FastState {
         net_pos: NetWorldPos,
@@ -650,6 +651,7 @@ struct ConnectedPeer {
     tx: tokio::sync::mpsc::UnboundedSender<NetServerMsg>,
     snap: NetPlayerSnapshot,
     awaiting_creation: bool,
+    reset_on_creation: bool,
 }
 
 /// Inspects a persisted server world file (e.g. `saves/embedded_mp_world.bin`) without starting
@@ -913,6 +915,66 @@ impl ServerWorldHub {
         }
     }
 
+    fn purge_character_for_reset(&mut self, uid: u64) {
+        self.release_player_vehicle_seats(uid);
+        self.characters.remove(&uid);
+
+        if let Some((gid, role, gname)) = self.find_player_guild(uid) {
+            if role == PlayerGuildRole::Founder {
+                let member_uids: Vec<u64> = self
+                    .guilds
+                    .get(&gid)
+                    .map(|g| g.members.iter().map(|m| m.uid).collect())
+                    .unwrap_or_default();
+                self.guilds.remove(&gid);
+                self.vehicles.retain(|_, v| v.guild_id != Some(gid));
+                for og in self.guilds.values_mut() {
+                    og.stances.remove(&gid);
+                }
+                for m_uid in member_uids {
+                    if m_uid == uid {
+                        continue;
+                    }
+                    if let Some(p) = self.peers.get_mut(&m_uid) {
+                        p.snap.guild_id = None;
+                        p.snap.guild_name.clear();
+                        p.snap.guild_role = PlayerGuildRole::Founder;
+                        let _ = p.tx.send(NetServerMsg::GuildRoleUpdated {
+                            guild_id: None,
+                            role: PlayerGuildRole::Founder,
+                            banner_msg: format!(
+                                "Die Gilde '{}' wurde durch Charakter-Neustart des Gründers aufgelöst.",
+                                gname
+                            ),
+                        });
+                    }
+                }
+                self.broadcast_all(&NetServerMsg::ChatBroadcast {
+                    sender: "Server".to_string(),
+                    text: format!(
+                        "Die Gilde '{}' wurde durch Charakter-Neustart des Gründers aufgelöst.",
+                        gname
+                    ),
+                    is_system: true,
+                });
+            } else if let Some(g) = self.guilds.get_mut(&gid) {
+                g.members.retain(|m| m.uid != uid);
+            }
+        }
+
+        self.vehicles
+            .retain(|_, v| !(v.owner_uid == uid && v.guild_id.is_none()));
+        for g in self.guilds.values_mut() {
+            g.pending_invites.retain(|&u| u != uid);
+        }
+        if let Some(p) = self.peers.get_mut(&uid) {
+            p.snap.guild_id = None;
+            p.snap.guild_name.clear();
+            p.snap.guild_role = PlayerGuildRole::Founder;
+        }
+        self.dirty = true;
+    }
+
     fn handle_disconnect(&mut self, uid: u64) {
         self.release_player_vehicle_seats(uid);
         if let Some(peer) = self.peers.remove(&uid) {
@@ -1027,6 +1089,18 @@ impl ServerWorldHub {
                 }
                 ch.player_name = clean_name.clone();
                 ch.player_uid = uid;
+                let should_reset_old = self
+                    .peers
+                    .get_mut(&uid)
+                    .map(|p| {
+                        let r = p.reset_on_creation;
+                        p.reset_on_creation = false;
+                        r
+                    })
+                    .unwrap_or(false);
+                if should_reset_old {
+                    self.purge_character_for_reset(uid);
+                }
                 let is_brand_new = !self.characters.contains_key(&uid);
                 let directory_changed = self
                     .characters
@@ -2068,6 +2142,7 @@ fn process_hub_event(
                 role_id,
                 appearance_bytes,
                 net_pos,
+                reset_character,
             } = hello
             {
                 if protocol_version != PROTOCOL_VERSION {
@@ -2100,13 +2175,22 @@ fn process_hub_event(
                     return true;
                 }
 
-                let existing_guild = hub.find_player_guild(player_uid);
+                let existing_guild = if reset_character {
+                    None
+                } else {
+                    hub.find_player_guild(player_uid)
+                };
                 let (gid, grole, gname) = existing_guild
                     .map(|(id, r, n)| (Some(id), r, n))
                     .unwrap_or((None, PlayerGuildRole::Founder, String::new()));
 
-                let saved_char = hub.characters.get(&player_uid).cloned();
-                let awaiting_creation = saved_char.is_none() && name.trim().is_empty();
+                let saved_char = if reset_character {
+                    None
+                } else {
+                    hub.characters.get(&player_uid).cloned()
+                };
+                let awaiting_creation =
+                    reset_character || (saved_char.is_none() && name.trim().is_empty());
                 let (eff_name, eff_lvl, eff_role, eff_app, eff_pos) =
                     if let Some(ref sc) = saved_char {
                         (
@@ -2176,6 +2260,7 @@ fn process_hub_event(
                         tx,
                         snap,
                         awaiting_creation,
+                        reset_on_creation: reset_character,
                     },
                 );
                 online_count.store(hub.peers.len(), Ordering::Relaxed);
@@ -2360,6 +2445,7 @@ mod tests {
                             merc_x: 1_492_000.0,
                             merc_y: 6_894_000.0,
                         },
+                        reset_character: false,
                     },
                 )
                 .await
@@ -2470,6 +2556,7 @@ mod tests {
                             merc_x: 1_492_000.0,
                             merc_y: 6_894_000.0,
                         },
+                        reset_character: false,
                     },
                 )
                 .await
