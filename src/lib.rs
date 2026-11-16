@@ -12,8 +12,8 @@ pub const DEFAULT_SERVER_PORT: u16 = 27777;
 pub const LAN_DISCOVERY_PORT: u16 = 27778;
 pub const DEFAULT_EMBEDDED_MAX_PLAYERS: u8 = 4;
 pub const DEFAULT_DEDICATED_MAX_PLAYERS: u8 = 12;
-pub const PROTOCOL_VERSION: u32 = 3;
-pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V3";
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V4";
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 const LOCAL_INTEREST_RADIUS_M: f64 = 1_850.0;
@@ -232,6 +232,18 @@ pub struct WireServerCharacter {
     pub character_bincode: Vec<u8>,
 }
 
+/// Lightweight pre-flight summary of a player's server-saved character so the Main Menu OSM Map
+/// can show the player's exact last server location BEFORE connecting.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServerCharacterSummary {
+    pub player_name: String,
+    pub level: u32,
+    pub role_id: u8,
+    pub appearance_bytes: [u8; 24],
+    pub last_merc_x: f64,
+    pub last_merc_y: f64,
+}
+
 /// Public summary of every registered character on this Server (online & offline) so all players
 /// have a shared view of the server's hunters, levels, classes, appearances, and guilds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -282,6 +294,10 @@ pub struct LanBeaconReply {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NetClientMsg {
+    ProbeServer {
+        protocol_version: u32,
+        player_uid: u64,
+    },
     Hello {
         protocol_version: u32,
         player_uid: u64,
@@ -381,6 +397,15 @@ pub enum NetClientMsg {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NetServerMsg {
+    ServerProbeReply {
+        protocol_version: u32,
+        server_name: String,
+        cur_players: u8,
+        max_players: u8,
+        has_password: bool,
+        is_dedicated: bool,
+        existing_character: Option<ServerCharacterSummary>,
+    },
     Welcome {
         server_name: String,
         max_players: u8,
@@ -624,6 +649,23 @@ struct ConnectedPeer {
     uid: u64,
     tx: tokio::sync::mpsc::UnboundedSender<NetServerMsg>,
     snap: NetPlayerSnapshot,
+    awaiting_creation: bool,
+}
+
+/// Inspects a persisted server world file (e.g. `saves/embedded_mp_world.bin`) without starting
+/// the server so the Main Menu OSM Map can immediately display the host's last saved server position.
+pub fn peek_saved_character_summary(save_path: &str, player_uid: u64) -> Option<ServerCharacterSummary> {
+    let bytes = std::fs::read(save_path).ok()?;
+    let saved = bincode::deserialize::<PersistedServerWorld>(&bytes).ok()?;
+    let ch = saved.characters.into_iter().find(|c| c.player_uid == player_uid)?;
+    Some(ServerCharacterSummary {
+        player_name: ch.player_name,
+        level: ch.level,
+        role_id: ch.role_id,
+        appearance_bytes: ch.appearance_bytes,
+        last_merc_x: ch.last_merc_x,
+        last_merc_y: ch.last_merc_y,
+    })
 }
 
 #[derive(Default)]
@@ -874,6 +916,9 @@ impl ServerWorldHub {
     fn handle_disconnect(&mut self, uid: u64) {
         self.release_player_vehicle_seats(uid);
         if let Some(peer) = self.peers.remove(&uid) {
+            if peer.awaiting_creation {
+                return;
+            }
             for g in self.guilds.values_mut() {
                 for m in &mut g.members {
                     if m.uid == uid {
@@ -885,7 +930,7 @@ impl ServerWorldHub {
                 println!(
                     "[DDNeo-Server] Spieler getrennt: '{}' ({}/{} online)",
                     peer.snap.name,
-                    self.peers.len(),
+                    self.peers.values().filter(|p| !p.awaiting_creation).count(),
                     self.config.max_players
                 );
             }
@@ -901,7 +946,7 @@ impl ServerWorldHub {
 
     fn handle_msg(&mut self, uid: u64, msg: NetClientMsg) {
         match msg {
-            NetClientMsg::Hello { .. } => {}
+            NetClientMsg::ProbeServer { .. } | NetClientMsg::Hello { .. } => {}
             NetClientMsg::FastState {
                 net_pos,
                 vel,
@@ -976,7 +1021,13 @@ impl ServerWorldHub {
                 }
             }
             NetClientMsg::SyncCharacter(mut ch) => {
+                let clean_name = ch.player_name.trim().to_string();
+                if clean_name.is_empty() {
+                    return;
+                }
+                ch.player_name = clean_name.clone();
                 ch.player_uid = uid;
+                let is_brand_new = !self.characters.contains_key(&uid);
                 let directory_changed = self
                     .characters
                     .get(&uid)
@@ -985,7 +1036,16 @@ impl ServerWorldHub {
                             || prev.player_name != ch.player_name
                             || prev.role_id != ch.role_id
                     });
+                let mut completed_creation = false;
                 if let Some(peer) = self.peers.get_mut(&uid) {
+                    if peer.awaiting_creation {
+                        peer.awaiting_creation = false;
+                        peer.snap.net_pos = NetWorldPos::Overworld {
+                            merc_x: ch.last_merc_x,
+                            merc_y: ch.last_merc_y,
+                        };
+                        completed_creation = true;
+                    }
                     peer.snap.name = ch.player_name.clone();
                     peer.snap.level = ch.level;
                     peer.snap.role_id = ch.role_id;
@@ -1001,7 +1061,26 @@ impl ServerWorldHub {
                 }
                 self.characters.insert(uid, ch);
                 self.dirty = true;
-                if directory_changed {
+                if completed_creation {
+                    if self.config.is_dedicated {
+                        println!(
+                            "[DDNeo-Server] Neuer Charakter erstellt & verbunden: '{}' (UID {}, {}/{} online)",
+                            clean_name,
+                            uid,
+                            self.peers.values().filter(|p| !p.awaiting_creation).count(),
+                            self.config.max_players
+                        );
+                    }
+                    self.broadcast_all(&NetServerMsg::ChatBroadcast {
+                        sender: "Server".to_string(),
+                        text: format!("{} ist der Welt beigetreten!", clean_name),
+                        is_system: true,
+                    });
+                }
+                if is_brand_new || completed_creation {
+                    self.save_if_needed(true);
+                }
+                if directory_changed || completed_creation {
                     self.publish_macro_sync();
                 }
             }
@@ -1623,10 +1702,15 @@ impl ServerWorldHub {
         if self.peers.is_empty() || (self.peers.len() == 1 && self.vehicles.is_empty()) {
             return;
         }
-        let all_snaps: Vec<&NetPlayerSnapshot> = self.peers.values().map(|p| &p.snap).collect();
+        let all_snaps: Vec<&NetPlayerSnapshot> = self
+            .peers
+            .values()
+            .filter(|p| !p.awaiting_creation)
+            .map(|p| &p.snap)
+            .collect();
         let all_vehs: Vec<&WireVehicle> = self.vehicles.values().collect();
 
-        for peer in self.peers.values() {
+        for peer in self.peers.values().filter(|p| !p.awaiting_creation) {
             let nearby_players: Vec<NetPlayerSnapshot> = all_snaps
                 .iter()
                 .filter(|s| s.uid != peer.uid && peer.snap.net_pos.is_within_local_bubble(&s.net_pos))
@@ -1656,13 +1740,21 @@ impl ServerWorldHub {
         if self.peers.is_empty() {
             return;
         }
-        let players: Vec<NetPlayerSnapshot> =
-            self.peers.values().map(|p| p.snap.clone()).collect();
+        let players: Vec<NetPlayerSnapshot> = self
+            .peers
+            .values()
+            .filter(|p| !p.awaiting_creation)
+            .map(|p| p.snap.clone())
+            .collect();
         let mut character_directory: Vec<NetCharacterDirectoryEntry> = self
             .characters
             .values()
             .map(|ch| {
                 let ginfo = self.find_player_guild(ch.player_uid);
+                let is_online = self
+                    .peers
+                    .get(&ch.player_uid)
+                    .map_or(false, |p| !p.awaiting_creation);
                 NetCharacterDirectoryEntry {
                     uid: ch.player_uid,
                     name: ch.player_name.clone(),
@@ -1671,14 +1763,14 @@ impl ServerWorldHub {
                     appearance_bytes: ch.appearance_bytes,
                     guild_id: ginfo.as_ref().map(|(id, _, _)| *id),
                     guild_name: ginfo.map(|(_, _, n)| n).unwrap_or_default(),
-                    online: self.peers.contains_key(&ch.player_uid),
+                    online: is_online,
                     last_merc_x: ch.last_merc_x,
                     last_merc_y: ch.last_merc_y,
                 }
             })
             .collect();
         // Also include any newly connected peers who haven't pushed their first SyncCharacter yet
-        for p in self.peers.values() {
+        for p in self.peers.values().filter(|p| !p.awaiting_creation) {
             if !self.characters.contains_key(&p.uid) {
                 let (mx, my) = match p.snap.net_pos {
                     NetWorldPos::Overworld { merc_x, merc_y } => (merc_x, merc_y),
@@ -1725,6 +1817,10 @@ impl ServerWorldHub {
 }
 
 enum HubEvent {
+    ProbeQuery {
+        player_uid: u64,
+        reply_tx: tokio::sync::oneshot::Sender<NetServerMsg>,
+    },
     PeerConnected {
         hello: NetClientMsg,
         tx: tokio::sync::mpsc::UnboundedSender<NetServerMsg>,
@@ -1800,13 +1896,33 @@ pub async fn run_server_on_listener(
             let p_stop = Arc::clone(&accept_stop);
             tokio::spawn(async move {
                 let (mut rd, mut wr) = stream.into_split();
-                let Ok(Ok(hello)) =
+                let Ok(Ok(first_msg)) =
                     tokio::time::timeout(Duration::from_secs(5), read_packet::<NetClientMsg>(&mut rd))
                         .await
                 else {
                     return;
                 };
-                let NetClientMsg::Hello { player_uid, .. } = &hello else {
+                if let NetClientMsg::ProbeServer {
+                    protocol_version: _,
+                    player_uid,
+                } = first_msg
+                {
+                    let (rep_tx, rep_rx) = tokio::sync::oneshot::channel::<NetServerMsg>();
+                    if h_tx
+                        .send(HubEvent::ProbeQuery {
+                            player_uid,
+                            reply_tx: rep_tx,
+                        })
+                        .is_ok()
+                    {
+                        if let Ok(reply) = rep_rx.await {
+                            let _ = write_packet(&mut wr, &reply).await;
+                            let _ = tokio::io::AsyncWriteExt::flush(&mut wr).await;
+                        }
+                    }
+                    return;
+                }
+                let NetClientMsg::Hello { player_uid, .. } = &first_msg else {
                     return;
                 };
                 let uid = *player_uid;
@@ -1814,7 +1930,7 @@ pub async fn run_server_on_listener(
                 let (acc_tx, acc_rx) = tokio::sync::oneshot::channel::<bool>();
                 if h_tx
                     .send(HubEvent::PeerConnected {
-                        hello,
+                        hello: first_msg,
                         tx: out_tx,
                         accept_tx: acc_tx,
                     })
@@ -1908,6 +2024,36 @@ fn process_hub_event(
 ) -> bool {
     match ev {
         HubEvent::Shutdown => return false,
+        HubEvent::ProbeQuery {
+            player_uid,
+            reply_tx,
+        } => {
+            let existing_character = hub.characters.get(&player_uid).map(|ch| {
+                ServerCharacterSummary {
+                    player_name: ch.player_name.clone(),
+                    level: ch.level,
+                    role_id: ch.role_id,
+                    appearance_bytes: ch.appearance_bytes,
+                    last_merc_x: ch.last_merc_x,
+                    last_merc_y: ch.last_merc_y,
+                }
+            });
+            let active_online = hub
+                .peers
+                .values()
+                .filter(|p| !p.awaiting_creation)
+                .count()
+                .min(255) as u8;
+            let _ = reply_tx.send(NetServerMsg::ServerProbeReply {
+                protocol_version: PROTOCOL_VERSION,
+                server_name: hub.config.session_name.clone(),
+                cur_players: active_online,
+                max_players: hub.config.max_players,
+                has_password: !hub.config.password.is_empty(),
+                is_dedicated: hub.config.is_dedicated,
+                existing_character,
+            });
+        }
         HubEvent::PeerConnected {
             hello,
             tx,
@@ -1960,6 +2106,7 @@ fn process_hub_event(
                     .unwrap_or((None, PlayerGuildRole::Founder, String::new()));
 
                 let saved_char = hub.characters.get(&player_uid).cloned();
+                let awaiting_creation = saved_char.is_none() && name.trim().is_empty();
                 let (eff_name, eff_lvl, eff_role, eff_app, eff_pos) =
                     if let Some(ref sc) = saved_char {
                         (
@@ -1973,16 +2120,18 @@ fn process_hub_event(
                             },
                         )
                     } else {
-                        (name.clone(), 1, role_id, appearance_bytes, net_pos)
+                        (name.trim().to_string(), 1, role_id, appearance_bytes, net_pos)
                     };
 
-                if let Some(id) = gid {
-                    if let Some(g) = hub.guilds.get_mut(&id) {
-                        for m in &mut g.members {
-                            if m.uid == player_uid {
-                                m.online = true;
-                                m.name = eff_name.clone();
-                                m.level = eff_lvl;
+                if !awaiting_creation {
+                    if let Some(id) = gid {
+                        if let Some(g) = hub.guilds.get_mut(&id) {
+                            for m in &mut g.members {
+                                if m.uid == player_uid {
+                                    m.online = true;
+                                    m.name = eff_name.clone();
+                                    m.level = eff_lvl;
+                                }
                             }
                         }
                     }
@@ -2026,25 +2175,28 @@ fn process_hub_event(
                         uid: player_uid,
                         tx,
                         snap,
+                        awaiting_creation,
                     },
                 );
                 online_count.store(hub.peers.len(), Ordering::Relaxed);
                 let _ = accept_tx.send(true);
 
-                if hub.config.is_dedicated {
-                    println!(
-                        "[DDNeo-Server] Spieler verbunden: '{}' (UID {}, {}/{} online)",
-                        eff_name,
-                        player_uid,
-                        hub.peers.len(),
-                        hub.config.max_players
-                    );
+                if !awaiting_creation {
+                    if hub.config.is_dedicated {
+                        println!(
+                            "[DDNeo-Server] Spieler verbunden: '{}' (UID {}, {}/{} online)",
+                            eff_name,
+                            player_uid,
+                            hub.peers.values().filter(|p| !p.awaiting_creation).count(),
+                            hub.config.max_players
+                        );
+                    }
+                    hub.broadcast_all(&NetServerMsg::ChatBroadcast {
+                        sender: "Server".to_string(),
+                        text: format!("{} ist der Welt beigetreten!", eff_name),
+                        is_system: true,
+                    });
                 }
-                hub.broadcast_all(&NetServerMsg::ChatBroadcast {
-                    sender: "Server".to_string(),
-                    text: format!("{} ist der Welt beigetreten!", eff_name),
-                    is_system: true,
-                });
                 hub.publish_macro_sync();
                 hub.write_status_json();
             }
