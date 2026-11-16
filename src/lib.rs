@@ -12,8 +12,8 @@ pub const DEFAULT_SERVER_PORT: u16 = 27777;
 pub const LAN_DISCOVERY_PORT: u16 = 27778;
 pub const DEFAULT_EMBEDDED_MAX_PLAYERS: u8 = 4;
 pub const DEFAULT_DEDICATED_MAX_PLAYERS: u8 = 12;
-pub const PROTOCOL_VERSION: u32 = 2;
-pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V2";
+pub const PROTOCOL_VERSION: u32 = 3;
+pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V3";
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 const LOCAL_INTEREST_RADIUS_M: f64 = 1_850.0;
@@ -219,6 +219,35 @@ pub struct WireSharedGroundLoot {
     pub item_bincode: Vec<u8>,
 }
 
+/// Complete online character profile stored centrally on the Server (`saves/server_world.bin`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireServerCharacter {
+    pub player_uid: u64,
+    pub player_name: String,
+    pub level: u32,
+    pub role_id: u8,
+    pub appearance_bytes: [u8; 24],
+    pub last_merc_x: f64,
+    pub last_merc_y: f64,
+    pub character_bincode: Vec<u8>,
+}
+
+/// Public summary of every registered character on this Server (online & offline) so all players
+/// have a shared view of the server's hunters, levels, classes, appearances, and guilds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NetCharacterDirectoryEntry {
+    pub uid: u64,
+    pub name: String,
+    pub level: u32,
+    pub role_id: u8,
+    pub appearance_bytes: [u8; 24],
+    pub guild_id: Option<u64>,
+    pub guild_name: String,
+    pub online: bool,
+    pub last_merc_x: f64,
+    pub last_merc_y: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetPlayerSnapshot {
     pub uid: u64,
@@ -277,6 +306,7 @@ pub enum NetClientMsg {
         attack_pulse: u8,
         driven_vehicle: Option<WireVehicle>,
     },
+    SyncCharacter(WireServerCharacter),
     FoundPlayerGuild {
         name: String,
         initial_bases: Vec<WireClaimedBase>,
@@ -361,6 +391,7 @@ pub enum NetServerMsg {
         assigned_guild_role: PlayerGuildRole,
         sealed_portals: Vec<u64>,
         stabilized_portals: Vec<u64>,
+        saved_character: Option<WireServerCharacter>,
     },
     Rejected {
         reason: String,
@@ -372,6 +403,7 @@ pub enum NetServerMsg {
     WorldMacroSync {
         world_hour: f32,
         players: Vec<NetPlayerSnapshot>,
+        character_directory: Vec<NetCharacterDirectoryEntry>,
         guilds: Vec<WirePlayerGuild>,
         all_vehicles: Vec<WireVehicle>,
     },
@@ -562,6 +594,7 @@ struct PersistedServerWorld {
     world_hour: f32,
     next_guild_id: u64,
     next_loot_id: u64,
+    characters: Vec<WireServerCharacter>,
     guilds: Vec<WirePlayerGuild>,
     vehicles: Vec<WireVehicle>,
     sealed_portals: Vec<u64>,
@@ -573,6 +606,7 @@ struct LiveServerStatusJson<'a> {
     session_name: &'a str,
     tcp_port: u16,
     online_players: usize,
+    registered_characters: usize,
     max_players: u8,
     hibernating: bool,
     player_names: Vec<&'a str>,
@@ -605,6 +639,7 @@ struct ServerWorldHub {
     world_seed: u64,
     world_hour: f32,
     peers: HashMap<u64, ConnectedPeer>,
+    characters: HashMap<u64, WireServerCharacter>,
     guilds: HashMap<u64, WirePlayerGuild>,
     vehicles: HashMap<u64, WireVehicle>,
     dungeons: HashMap<u64, LiveDungeonInstance>,
@@ -625,6 +660,7 @@ impl ServerWorldHub {
             world_seed: rand::random::<u64>() | 1,
             world_hour: 14.0,
             peers: HashMap::new(),
+            characters: HashMap::new(),
             guilds: HashMap::new(),
             vehicles: HashMap::new(),
             dungeons: HashMap::new(),
@@ -661,6 +697,9 @@ impl ServerWorldHub {
                     self.world_hour = saved.world_hour.rem_euclid(24.0);
                     self.next_guild_id = saved.next_guild_id.max(1);
                     self.next_loot_id = saved.next_loot_id.max(1);
+                    for ch in saved.characters {
+                        self.characters.insert(ch.player_uid, ch);
+                    }
                     for mut g in saved.guilds {
                         for m in &mut g.members {
                             m.online = false;
@@ -677,8 +716,9 @@ impl ServerWorldHub {
                     self.stabilized_portals = saved.stabilized_portals.into_iter().collect();
                     if self.config.is_dedicated {
                         println!(
-                            "[DDNeo-Server] Weltstatus geladen aus '{}': {} Gilden, {} Fahrzeuge, {} Risse versiegelt (Seed {}).",
+                            "[DDNeo-Server] Weltstatus geladen aus '{}': {} Charaktere, {} Gilden, {} Fahrzeuge, {} Risse versiegelt (Seed {}).",
                             path_str,
+                            self.characters.len(),
                             self.guilds.len(),
                             self.vehicles.len(),
                             self.sealed_portals.len(),
@@ -718,11 +758,12 @@ impl ServerWorldHub {
             }
         }
         let snap = PersistedServerWorld {
-            version: 1,
+            version: 2,
             world_seed: self.world_seed,
             world_hour: self.world_hour,
             next_guild_id: self.next_guild_id,
             next_loot_id: self.next_loot_id,
+            characters: self.characters.values().cloned().collect(),
             guilds: self.guilds.values().cloned().collect(),
             vehicles: self.vehicles.values().cloned().collect(),
             sealed_portals: self.sealed_portals.iter().copied().collect(),
@@ -758,6 +799,7 @@ impl ServerWorldHub {
             session_name: &self.config.session_name,
             tcp_port: self.bound_port,
             online_players: self.peers.len(),
+            registered_characters: self.characters.len(),
             max_players: self.config.max_players,
             hibernating: self.peers.is_empty() && self.config.pause_when_empty,
             player_names: self.peers.values().map(|p| p.snap.name.as_str()).collect(),
@@ -852,6 +894,7 @@ impl ServerWorldHub {
                 text: format!("{} hat die Sitzung verlassen.", peer.snap.name),
                 is_system: true,
             });
+            self.publish_macro_sync();
             self.save_if_needed(true);
         }
     }
@@ -921,6 +964,45 @@ impl ServerWorldHub {
                         self.vehicles.insert(vid, dv);
                         self.dirty = true;
                     }
+                }
+                if let NetWorldPos::Overworld { merc_x, merc_y } = net_pos {
+                    if let Some(ch) = self.characters.get_mut(&uid) {
+                        ch.last_merc_x = merc_x;
+                        ch.last_merc_y = merc_y;
+                        ch.level = level;
+                        ch.role_id = role_id;
+                        ch.appearance_bytes = appearance_bytes;
+                    }
+                }
+            }
+            NetClientMsg::SyncCharacter(mut ch) => {
+                ch.player_uid = uid;
+                let directory_changed = self
+                    .characters
+                    .get(&uid)
+                    .map_or(true, |prev| {
+                        prev.level != ch.level
+                            || prev.player_name != ch.player_name
+                            || prev.role_id != ch.role_id
+                    });
+                if let Some(peer) = self.peers.get_mut(&uid) {
+                    peer.snap.name = ch.player_name.clone();
+                    peer.snap.level = ch.level;
+                    peer.snap.role_id = ch.role_id;
+                    peer.snap.appearance_bytes = ch.appearance_bytes;
+                }
+                if let Some((gid, _, _)) = self.find_player_guild(uid) {
+                    if let Some(g) = self.guilds.get_mut(&gid) {
+                        if let Some(m) = g.members.iter_mut().find(|m| m.uid == uid) {
+                            m.name = ch.player_name.clone();
+                            m.level = ch.level;
+                        }
+                    }
+                }
+                self.characters.insert(uid, ch);
+                self.dirty = true;
+                if directory_changed {
+                    self.publish_macro_sync();
                 }
             }
             NetClientMsg::FoundPlayerGuild {
@@ -1576,11 +1658,54 @@ impl ServerWorldHub {
         }
         let players: Vec<NetPlayerSnapshot> =
             self.peers.values().map(|p| p.snap.clone()).collect();
+        let mut character_directory: Vec<NetCharacterDirectoryEntry> = self
+            .characters
+            .values()
+            .map(|ch| {
+                let ginfo = self.find_player_guild(ch.player_uid);
+                NetCharacterDirectoryEntry {
+                    uid: ch.player_uid,
+                    name: ch.player_name.clone(),
+                    level: ch.level,
+                    role_id: ch.role_id,
+                    appearance_bytes: ch.appearance_bytes,
+                    guild_id: ginfo.as_ref().map(|(id, _, _)| *id),
+                    guild_name: ginfo.map(|(_, _, n)| n).unwrap_or_default(),
+                    online: self.peers.contains_key(&ch.player_uid),
+                    last_merc_x: ch.last_merc_x,
+                    last_merc_y: ch.last_merc_y,
+                }
+            })
+            .collect();
+        // Also include any newly connected peers who haven't pushed their first SyncCharacter yet
+        for p in self.peers.values() {
+            if !self.characters.contains_key(&p.uid) {
+                let (mx, my) = match p.snap.net_pos {
+                    NetWorldPos::Overworld { merc_x, merc_y } => (merc_x, merc_y),
+                    _ => (0.0, 0.0),
+                };
+                character_directory.push(NetCharacterDirectoryEntry {
+                    uid: p.uid,
+                    name: p.snap.name.clone(),
+                    level: p.snap.level,
+                    role_id: p.snap.role_id,
+                    appearance_bytes: p.snap.appearance_bytes,
+                    guild_id: p.snap.guild_id,
+                    guild_name: p.snap.guild_name.clone(),
+                    online: true,
+                    last_merc_x: mx,
+                    last_merc_y: my,
+                });
+            }
+        }
+        character_directory.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| b.level.cmp(&a.level)));
+
         let guilds: Vec<WirePlayerGuild> = self.guilds.values().cloned().collect();
         let all_vehicles: Vec<WireVehicle> = self.vehicles.values().cloned().collect();
         let msg = NetServerMsg::WorldMacroSync {
             world_hour: self.world_hour,
             players,
+            character_directory,
             guilds,
             all_vehicles,
         };
@@ -1793,7 +1918,7 @@ fn process_hub_event(
                 player_uid,
                 name,
                 password,
-                level,
+                level: _,
                 role_id,
                 appearance_bytes,
                 net_pos,
@@ -1834,13 +1959,30 @@ fn process_hub_event(
                     .map(|(id, r, n)| (Some(id), r, n))
                     .unwrap_or((None, PlayerGuildRole::Founder, String::new()));
 
+                let saved_char = hub.characters.get(&player_uid).cloned();
+                let (eff_name, eff_lvl, eff_role, eff_app, eff_pos) =
+                    if let Some(ref sc) = saved_char {
+                        (
+                            sc.player_name.clone(),
+                            sc.level,
+                            sc.role_id,
+                            sc.appearance_bytes,
+                            NetWorldPos::Overworld {
+                                merc_x: sc.last_merc_x,
+                                merc_y: sc.last_merc_y,
+                            },
+                        )
+                    } else {
+                        (name.clone(), 1, role_id, appearance_bytes, net_pos)
+                    };
+
                 if let Some(id) = gid {
                     if let Some(g) = hub.guilds.get_mut(&id) {
                         for m in &mut g.members {
                             if m.uid == player_uid {
                                 m.online = true;
-                                m.name = name.clone();
-                                m.level = level;
+                                m.name = eff_name.clone();
+                                m.level = eff_lvl;
                             }
                         }
                     }
@@ -1848,14 +1990,14 @@ fn process_hub_event(
 
                 let snap = NetPlayerSnapshot {
                     uid: player_uid,
-                    name: name.clone(),
-                    level,
-                    role_id,
+                    name: eff_name.clone(),
+                    level: eff_lvl,
+                    role_id: eff_role,
                     guild_id: gid,
                     guild_name: gname,
                     guild_role: grole,
-                    appearance_bytes,
-                    net_pos,
+                    appearance_bytes: eff_app,
+                    net_pos: eff_pos,
                     vel: [0.0, 0.0],
                     aim_dir: [1.0, 0.0],
                     hp: 100.0,
@@ -1875,6 +2017,7 @@ fn process_hub_event(
                     assigned_guild_role: grole,
                     sealed_portals: hub.sealed_portals.iter().copied().collect(),
                     stabilized_portals: hub.stabilized_portals.iter().copied().collect(),
+                    saved_character: saved_char,
                 });
 
                 hub.peers.insert(
@@ -1891,7 +2034,7 @@ fn process_hub_event(
                 if hub.config.is_dedicated {
                     println!(
                         "[DDNeo-Server] Spieler verbunden: '{}' (UID {}, {}/{} online)",
-                        name,
+                        eff_name,
                         player_uid,
                         hub.peers.len(),
                         hub.config.max_players
@@ -1899,7 +2042,7 @@ fn process_hub_event(
                 }
                 hub.broadcast_all(&NetServerMsg::ChatBroadcast {
                     sender: "Server".to_string(),
-                    text: format!("{} ist der Welt beigetreten!", name),
+                    text: format!("{} ist der Welt beigetreten!", eff_name),
                     is_system: true,
                 });
                 hub.publish_macro_sync();
@@ -2075,13 +2218,34 @@ mod tests {
                     NetServerMsg::Welcome {
                         world_seed,
                         is_dedicated,
+                        saved_character,
                         ..
                     } => {
                         assert!(is_dedicated);
+                        assert!(
+                            saved_character.is_none(),
+                            "Brand-new player on server must NOT inherit offline character"
+                        );
                         world_seed
                     }
                     other => panic!("Expected Welcome, got {:?}", other),
                 };
+
+                write_packet(
+                    &mut wr,
+                    &NetClientMsg::SyncCharacter(WireServerCharacter {
+                        player_uid: 555,
+                        player_name: "VpsFounder".to_string(),
+                        level: 7,
+                        role_id: 2,
+                        appearance_bytes: [7u8; 24],
+                        last_merc_x: 1_492_050.0,
+                        last_merc_y: 6_894_080.0,
+                        character_bincode: vec![42, 99, 101],
+                    }),
+                )
+                .await
+                .unwrap();
 
                 write_packet(
                     &mut wr,
@@ -2166,12 +2330,17 @@ mod tests {
                         assigned_guild_id,
                         assigned_guild_role,
                         sealed_portals,
+                        saved_character,
                         ..
                     } => {
                         assert_eq!(world_seed, first_seed, "World seed must persist across VPS reboot");
                         assert_eq!(assigned_guild_id, Some(1), "Guild membership must persist");
                         assert_eq!(assigned_guild_role, PlayerGuildRole::Founder);
                         assert!(sealed_portals.contains(&999), "Sealed portals must persist");
+                        let sc = saved_character
+                            .expect("Server-stored online character must be returned on reconnect");
+                        assert_eq!(sc.level, 7);
+                        assert_eq!(sc.character_bincode, vec![42, 99, 101]);
                     }
                     other => panic!("Expected Welcome on reboot, got {:?}", other),
                 }

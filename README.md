@@ -5,7 +5,7 @@ Eigenständiger, ressourcenschonender 24/7-Multiplayer-Server in **Rust** für *
 ## Eigenschaften
 - **Keine Grafik-/Karten-Abhängigkeiten:** Benötigt weder GPU/Vulkan noch X11/Wayland oder OpenStreetMap-`.pbf`-Dateien (nur ca. 20–40 MB RAM).
 - **0 %-CPU-Hibernation im Leerlauf (`pause_when_empty: true`):** Ist kein Spieler verbunden, legt sich die `20 Hz`-Schleife komplett schlafen und pausiert optional die Weltzeit, sodass über Nacht keine Gildenvorräte verbraucht werden.
-- **Persistenter Weltstatus (`saves/server_world.bin`):** Speichert Gilden, Außenposten, Kisten-Inventare, Forschung, Fahrzeuge, Diplomatie/PvP-Kriege, Welt-Seed und versiegelte/stabilisierte Portale alle 30 s sowie automatisch beim Stoppen (`SIGTERM` / `Strg+C`).
+- **Zentrale Server-Charaktere & Persistenter Weltstatus (`saves/server_world.bin`):** Verwaltet alle Online-Charaktere zentral auf dem Server (strikt getrennt vom lokalen Offline-Einzelspieler; Start auf Stufe 1 beim ersten Beitritt, zentrales Server-Charakterregister für alle Mitspieler) sowie Gilden, Außenposten, Kisten-Inventare, Forschung, Fahrzeuge, Diplomatie/PvP-Kriege, Welt-Seed und versiegelte/stabilisierte Portale alle 30 s sowie automatisch beim Stoppen (`SIGTERM` / `Strg+C`).
 - **Live-Statusdatei (`saves/server_status.json`):** Jederzeit per `cat saves/server_status.json` einsehbar.
 
 ---
