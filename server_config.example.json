@@ -1,0 +1,15 @@
+{
+  "bind_ip": "0.0.0.0",
+  "tcp_port": 27777,
+  "max_players": 12,
+  "session_name": "DDNeo 24/7 Weltserver",
+  "host_name": "Linux-VPS",
+  "password": "",
+  "lan_discovery": false,
+  "is_dedicated": true,
+  "pause_when_empty": true,
+  "save_interval_secs": 30,
+  "world_save_path": "saves/server_world.bin",
+  "status_json_path": "saves/server_status.json",
+  "ingame_day_real_secs": 1440.0
+}

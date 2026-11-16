@@ -1,0 +1,20 @@
+[package]
+name = "ddneo-server"
+version = "0.1.0"
+edition = "2021"
+description = "DDNeo (Dungeon Dive Neo) — Headless Dedicated & Embedded Multiplayer Server"
+
+[lib]
+name = "ddneo_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ddneo-server"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+rand = "0.10.2"

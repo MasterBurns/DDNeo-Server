@@ -1,0 +1,5 @@
+/target/
+/dist/
+/saves/
+/server_config.json
+*.tmp

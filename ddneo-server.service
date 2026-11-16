@@ -1,0 +1,21 @@
+[Unit]
+Description=DDNeo (Dungeon Dive Neo) 24/7 Dedicated Multiplayer Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ddneo
+Group=ddneo
+WorkingDirectory=/opt/ddneo-server
+ExecStart=/opt/ddneo-server/ddneo-server --config /opt/ddneo-server/server_config.json
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+MemoryMax=512M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

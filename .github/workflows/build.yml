@@ -1,0 +1,51 @@
+name: Build DDNeo-Server (Linux & Windows .exe)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Linux x86_64 (ddneo-server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Release Binary
+        run: cargo build --release
+      - name: Package Linux Server
+        run: |
+          mkdir -p pkg/saves
+          cp target/release/ddneo-server pkg/
+          cp server_config.example.json pkg/
+          cp server_config.example.json pkg/server_config.json
+          cp ddneo-server.service pkg/
+          cp install_vps_linux.sh pkg/
+          cp README.md pkg/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ddneo-server-linux-x86_64
+          path: pkg/
+
+  build-windows:
+    name: Windows x86_64 (ddneo-server.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Release .exe
+        run: cargo build --release
+      - name: Package Windows Server (.exe)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg/saves | Out-Null
+          Copy-Item target/release/ddneo-server.exe pkg/
+          Copy-Item server_config.example.json pkg/server_config.json
+          Copy-Item README.md pkg/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ddneo-server-windows-x86_64-exe
+          path: pkg/
