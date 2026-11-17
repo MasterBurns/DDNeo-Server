@@ -1,9 +1,12 @@
-name: Build DDNeo-Server (Linux & Windows .exe)
+name: Build & Release DDNeo-Server v0.1 (Linux & Windows .exe)
 
 on:
   push:
     branches: [ "main", "master" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-linux:
@@ -15,19 +18,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Release Binary
         run: cargo build --release
-      - name: Package Linux Server
+      - name: Run Server Unit Tests
+        run: cargo test
+      - name: Package Linux Server Archive
         run: |
-          mkdir -p pkg/saves
-          cp target/release/ddneo-server pkg/
-          cp server_config.example.json pkg/
-          cp server_config.example.json pkg/server_config.json
-          cp ddneo-server.service pkg/
-          cp install_vps_linux.sh pkg/
-          cp README.md pkg/
+          VER="v0.1.${{ github.run_number }}"
+          mkdir -p pkg/ddneo-server-linux/saves release-assets
+          touch pkg/ddneo-server-linux/saves/.keep
+          cp target/release/ddneo-server pkg/ddneo-server-linux/
+          cp server_config.example.json pkg/ddneo-server-linux/
+          cp server_config.example.json pkg/ddneo-server-linux/server_config.json
+          cp ddneo-server.service install_vps_linux.sh README.md pkg/ddneo-server-linux/
+          cp target/release/ddneo-server release-assets/ddneo-server-linux-x86_64
+          tar -C pkg -czf "release-assets/ddneo-server-linux-x86_64-${VER}.tar.gz" ddneo-server-linux
       - uses: actions/upload-artifact@v4
         with:
-          name: ddneo-server-linux-x86_64
-          path: pkg/
+          name: server-linux-assets
+          path: release-assets/*
 
   build-windows:
     name: Windows x86_64 (ddneo-server.exe)
@@ -38,14 +45,50 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Release .exe
         run: cargo build --release
-      - name: Package Windows Server (.exe)
+      - name: Package Windows Server (.exe & .zip)
         shell: pwsh
         run: |
+          $ver = "v0.1.${{ github.run_number }}"
           New-Item -ItemType Directory -Force -Path pkg/saves | Out-Null
+          Set-Content -Path pkg/saves/.keep -Value ""
           Copy-Item target/release/ddneo-server.exe pkg/
           Copy-Item server_config.example.json pkg/server_config.json
           Copy-Item README.md pkg/
+
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item target/release/ddneo-server.exe release-assets/ddneo-server.exe
+          Compress-Archive -Path pkg/* -DestinationPath "release-assets/ddneo-server-windows-$ver.zip" -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: ddneo-server-windows-x86_64-exe
-          path: pkg/
+          name: server-windows-assets
+          path: release-assets/*
+
+  publish-release:
+    name: Publish GitHub Release (v0.1.${{ github.run_number }})
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-windows-assets
+          path: release-files/
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-linux-assets
+          path: release-files/
+      - name: Create GitHub Release with Direct .exe Download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: DDNeo-Server v0.1.${{ github.run_number }}
+          make_latest: true
+          generate_release_notes: true
+          body: |
+            ### Direkt-Downloads (DDNeo-Server Version 0.1.${{ github.run_number }})
+            - **`ddneo-server.exe`** — Direkt ausführbarer Windows-Dedicated-Server
+            - **`ddneo-server-windows-v0.1.${{ github.run_number }}.zip`** — Windows-Server-Paket inkl. `server_config.json`
+            - **`ddneo-server-linux-x86_64`** — Direkt ausführbare Linux-Server-Binärdatei
+            - **`ddneo-server-linux-x86_64-v0.1.${{ github.run_number }}.tar.gz`** — Linux-VPS-Paket inkl. `install_vps_linux.sh` & `systemd`-Service
+          files: release-files/*
