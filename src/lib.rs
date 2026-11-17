@@ -12,8 +12,8 @@ pub const DEFAULT_SERVER_PORT: u16 = 27777;
 pub const LAN_DISCOVERY_PORT: u16 = 27778;
 pub const DEFAULT_EMBEDDED_MAX_PLAYERS: u8 = 4;
 pub const DEFAULT_DEDICATED_MAX_PLAYERS: u8 = 12;
-pub const PROTOCOL_VERSION: u32 = 5;
-pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V5";
+pub const PROTOCOL_VERSION: u32 = 6;
+pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V6";
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 const LOCAL_INTEREST_RADIUS_M: f64 = 1_850.0;
@@ -219,6 +219,20 @@ pub struct WireSharedGroundLoot {
     pub item_bincode: Vec<u8>,
 }
 
+/// Canonical planet-scale Overworld Rift descriptor (`f64` Web-Mercator) synchronized across
+/// all connected clients so Linux/Windows players ALWAYS see the exact same Rifts & levels,
+/// even if only one client has compiled the regional OSM `.pbf` data locally.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WireOverworldRift {
+    pub id: u64,
+    pub merc_x: f64,
+    pub merc_y: f64,
+    pub theme: String,
+    pub color_rgba: [f32; 4],
+    pub level: u32,
+    pub max_floors: u32,
+}
+
 /// Complete online character profile stored centrally on the Server (`saves/server_world.bin`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireServerCharacter {
@@ -391,6 +405,19 @@ pub enum NetClientMsg {
         seed: u64,
         stabilized: bool,
     },
+    ReportChunkRifts {
+        chunk_x: i32,
+        chunk_y: i32,
+        from_real_osm: bool,
+        rifts: Vec<WireOverworldRift>,
+    },
+    OverworldRiftEnemyKilled {
+        portal_id: u64,
+        spawn_idx: u32,
+    },
+    OverworldPortalCleared {
+        portal_id: u64,
+    },
     Chat {
         text: String,
     },
@@ -483,6 +510,22 @@ pub enum NetServerMsg {
     PortalStateBroadcast {
         seed: u64,
         stabilized: bool,
+    },
+    ChunkRiftsSync {
+        chunk_x: i32,
+        chunk_y: i32,
+        from_real_osm: bool,
+        rifts: Vec<WireOverworldRift>,
+        killed_enemies: Vec<(u64, Vec<u32>)>,
+        dormant_portals: Vec<u64>,
+    },
+    OverworldRiftEnemyRemoved {
+        portal_id: u64,
+        spawn_idx: u32,
+        killer_uid: u64,
+    },
+    OverworldPortalDormant {
+        portal_id: u64,
     },
     BuildingDemolished {
         building_id: u64,
@@ -689,6 +732,9 @@ struct ServerWorldHub {
     dungeons: HashMap<u64, LiveDungeonInstance>,
     sealed_portals: HashSet<u64>,
     stabilized_portals: HashSet<u64>,
+    chunk_rifts: HashMap<(i32, i32), (bool, Vec<WireOverworldRift>)>,
+    overworld_rift_kills: HashMap<u64, HashSet<u32>>,
+    dormant_overworld_portals: HashSet<u64>,
     next_guild_id: u64,
     next_loot_id: u64,
     dirty: bool,
@@ -710,6 +756,9 @@ impl ServerWorldHub {
             dungeons: HashMap::new(),
             sealed_portals: HashSet::new(),
             stabilized_portals: HashSet::new(),
+            chunk_rifts: HashMap::new(),
+            overworld_rift_kills: HashMap::new(),
+            dormant_overworld_portals: HashSet::new(),
             next_guild_id: 1,
             next_loot_id: 1,
             dirty: false,
@@ -1744,8 +1793,63 @@ impl ServerWorldHub {
                     self.sealed_portals.insert(seed);
                     self.dungeons.remove(&seed);
                 }
+                self.overworld_rift_kills.remove(&seed);
+                self.dormant_overworld_portals.remove(&seed);
                 self.dirty = true;
                 self.broadcast_all(&NetServerMsg::PortalStateBroadcast { seed, stabilized });
+            }
+            NetClientMsg::ReportChunkRifts {
+                chunk_x,
+                chunk_y,
+                from_real_osm,
+                mut rifts,
+            } => {
+                if rifts.len() > 8 {
+                    rifts.truncate(8);
+                }
+                let key = (chunk_x, chunk_y);
+                let should_adopt = match self.chunk_rifts.get(&key) {
+                    None => true,
+                    Some((existing_osm, _)) => !*existing_osm && from_real_osm,
+                };
+                if should_adopt {
+                    if self.chunk_rifts.len() >= 4096 && !self.chunk_rifts.contains_key(&key) {
+                        if let Some(&evict_k) =
+                            self.chunk_rifts.iter().find(|(_, (osm, _))| !*osm).map(|(k, _)| k)
+                        {
+                            self.chunk_rifts.remove(&evict_k);
+                        }
+                    }
+                    self.chunk_rifts.insert(key, (from_real_osm, rifts));
+                    if let Some(sync_msg) = self.build_chunk_rifts_sync_msg(chunk_x, chunk_y) {
+                        self.broadcast_all(&sync_msg);
+                    }
+                } else if let Some(sync_msg) = self.build_chunk_rifts_sync_msg(chunk_x, chunk_y) {
+                    if let Some(p) = self.peers.get(&uid) {
+                        let _ = p.tx.send(sync_msg);
+                    }
+                }
+            }
+            NetClientMsg::OverworldRiftEnemyKilled {
+                portal_id,
+                spawn_idx,
+            } => {
+                if spawn_idx > 128 {
+                    return;
+                }
+                let set = self.overworld_rift_kills.entry(portal_id).or_default();
+                if set.insert(spawn_idx) {
+                    self.broadcast_all(&NetServerMsg::OverworldRiftEnemyRemoved {
+                        portal_id,
+                        spawn_idx,
+                        killer_uid: uid,
+                    });
+                }
+            }
+            NetClientMsg::OverworldPortalCleared { portal_id } => {
+                if self.dormant_overworld_portals.insert(portal_id) {
+                    self.broadcast_all(&NetServerMsg::OverworldPortalDormant { portal_id });
+                }
             }
             NetClientMsg::Chat { text } => {
                 let clean = text.trim();
@@ -1770,6 +1874,34 @@ impl ServerWorldHub {
         self.sealed_portals.remove(&seed);
         self.stabilized_portals.insert(seed);
         self.dungeons.remove(&seed);
+        self.overworld_rift_kills.remove(&seed);
+        self.dormant_overworld_portals.remove(&seed);
+    }
+
+    fn build_chunk_rifts_sync_msg(&self, chunk_x: i32, chunk_y: i32) -> Option<NetServerMsg> {
+        let (from_real_osm, rifts) = self.chunk_rifts.get(&(chunk_x, chunk_y))?;
+        let mut killed_enemies = Vec::new();
+        let mut dormant_portals = Vec::new();
+        for r in rifts {
+            if let Some(kills) = self.overworld_rift_kills.get(&r.id) {
+                if !kills.is_empty() {
+                    let mut v: Vec<u32> = kills.iter().copied().collect();
+                    v.sort_unstable();
+                    killed_enemies.push((r.id, v));
+                }
+            }
+            if self.dormant_overworld_portals.contains(&r.id) {
+                dormant_portals.push(r.id);
+            }
+        }
+        Some(NetServerMsg::ChunkRiftsSync {
+            chunk_x,
+            chunk_y,
+            from_real_osm: *from_real_osm,
+            rifts: rifts.clone(),
+            killed_enemies,
+            dormant_portals,
+        })
     }
 
     fn publish_local_bubbles(&self) {
@@ -2252,6 +2384,14 @@ fn process_hub_event(
                     stabilized_portals: hub.stabilized_portals.iter().copied().collect(),
                     saved_character: saved_char,
                 });
+
+                // Immediately push all server-authoritative Overworld chunk Rifts so newly joining
+                // clients (even without local OSM region data) see identical Rifts & monster kills!
+                for &(cx, cy) in hub.chunk_rifts.keys() {
+                    if let Some(sync_msg) = hub.build_chunk_rifts_sync_msg(cx, cy) {
+                        let _ = tx.send(sync_msg);
+                    }
+                }
 
                 hub.peers.insert(
                     player_uid,
