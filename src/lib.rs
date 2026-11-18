@@ -2725,11 +2725,12 @@ impl ServerWorldHub {
                         let (fb_x, fb_y) = ch_opt
                             .map(|c| (c.last_merc_x, c.last_merc_y))
                             .unwrap_or((0.0, 0.0));
-                        (
-                            fb_x,
-                            fb_y,
-                            format!("Riss-Dungeon #{} (Etage {}/{})", seed, floor, max_floors),
-                        )
+                        let d_lbl = if (seed & 0xFFFF_FF00_0000_0000) == 0xDD4E_E000_0000_0000 {
+                            "Initialisierungs-Riss (Pfadprüfung)".to_string()
+                        } else {
+                            format!("Riss-Dungeon #{} (Etage {}/{})", seed, floor, max_floors)
+                        };
+                        (fb_x, fb_y, d_lbl)
                     }
                 }
             } else if let Some(c) = ch_opt {
