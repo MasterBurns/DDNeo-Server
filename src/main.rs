@@ -1,4 +1,6 @@
-use ddneo_server::{run_server_on_listener, ServerConfig};
+use ddneo_server::{
+    admin::generate_random_admin_password, run_server_with_admin_listener, ServerConfig,
+};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,13 +13,18 @@ fn print_help() {
     println!();
     println!("Optionen:");
     println!("  --config <PFAD>       Pfad zur Konfigurationsdatei (Standard: server_config.json)");
-    println!("  --bind <IP>           Bind-Adresse (Standard: 0.0.0.0)");
-    println!("  --port <PORT>         TCP-Port (Standard: 27777)");
+    println!("  --bind <IP>           Bind-Adresse Spielserver (Standard: 0.0.0.0)");
+    println!("  --port <PORT>         TCP-Port Spielserver (Standard: 27777)");
     println!("  --max-players <N>     Maximale Spieleranzahl (Standard: 12)");
     println!("  --name <TEXT>         Angezeigter Sitzungsname");
-    println!("  --password <TEXT>     Optionales Server-Passwort");
+    println!("  --password <TEXT>     Optionales Beitritts-Passwort für Spieler");
     println!("  --lan                 UDP-LAN-Erkennung (Port 27778) aktivieren");
     println!("  --no-pause-empty      Weltzeit läuft weiter, auch wenn 0 Spieler online sind");
+    println!("  --admin-bind <IP>     Bind-Adresse Web-Admin-Panel (Standard: 0.0.0.0)");
+    println!("  --admin-port <PORT>   HTTP-Port Web-Admin-Panel (Standard: 27779)");
+    println!("  --admin-user <NAME>   Admin-Benutzername (überschreibt server_config.json)");
+    println!("  --admin-pass <TEXT>   Admin-Passwort (überschreibt server_config.json)");
+    println!("  --no-admin            Web-Admin-Oberfläche deaktivieren");
     println!("  -h, --help            Diese Hilfe anzeigen");
 }
 
@@ -43,6 +50,8 @@ async fn main() {
         i += 1;
     }
 
+    let mut config_dirty = false;
+    let mut generated_initial_admin_pass = false;
     let mut cfg = if Path::new(&config_path).exists() {
         match std::fs::read_to_string(&config_path) {
             Ok(txt) => match serde_json::from_str::<ServerConfig>(&txt) {
@@ -52,23 +61,31 @@ async fn main() {
                         "[DDNeo-Server] Fehler in '{}': {} — verwende Standardwerte.",
                         config_path, e
                     );
-                    ServerConfig::default()
+                    let mut d = ServerConfig::default();
+                    d.admin_enabled = true;
+                    d
                 }
             },
-            Err(_) => ServerConfig::default(),
+            Err(_) => {
+                let mut d = ServerConfig::default();
+                d.admin_enabled = true;
+                d
+            }
         }
     } else {
-        let def = ServerConfig::default();
-        if let Ok(pretty) = serde_json::to_string_pretty(&def) {
-            let _ = std::fs::write(&config_path, pretty);
-            println!(
-                "[DDNeo-Server] Standard-Konfiguration '{}' wurde angelegt.",
-                config_path
-            );
-        }
+        let mut def = ServerConfig::default();
+        def.admin_enabled = true;
+        def.admin_password = generate_random_admin_password();
+        generated_initial_admin_pass = true;
+        config_dirty = true;
+        println!(
+            "[DDNeo-Server] Standard-Konfiguration '{}' wird angelegt …",
+            config_path
+        );
         def
     };
     cfg.is_dedicated = true;
+    cfg.config_file_path = Some(config_path.clone());
 
     // Apply CLI overrides
     let mut i = 0;
@@ -117,9 +134,53 @@ async fn main() {
                 i += 1;
                 continue;
             }
+            "--admin-bind" if i + 1 < args.len() => {
+                cfg.admin_bind_ip = args[i + 1].clone();
+                cfg.admin_enabled = true;
+                i += 2;
+                continue;
+            }
+            "--admin-port" if i + 1 < args.len() => {
+                if let Ok(p) = args[i + 1].parse::<u16>() {
+                    cfg.admin_port = p;
+                    cfg.admin_enabled = true;
+                }
+                i += 2;
+                continue;
+            }
+            "--admin-user" if i + 1 < args.len() => {
+                cfg.admin_username = args[i + 1].clone();
+                i += 2;
+                continue;
+            }
+            "--admin-pass" if i + 1 < args.len() => {
+                cfg.admin_password = args[i + 1].clone();
+                i += 2;
+                continue;
+            }
+            "--no-admin" => {
+                cfg.admin_enabled = false;
+                i += 1;
+                continue;
+            }
             _ => {}
         }
         i += 1;
+    }
+
+    if cfg.admin_enabled && cfg.admin_username.trim().is_empty() {
+        cfg.admin_username = "admin".to_string();
+        config_dirty = true;
+    }
+    if cfg.admin_enabled && cfg.admin_password.trim().is_empty() {
+        cfg.admin_password = generate_random_admin_password();
+        generated_initial_admin_pass = true;
+        config_dirty = true;
+    }
+    if config_dirty {
+        if let Ok(pretty) = serde_json::to_string_pretty(&cfg) {
+            let _ = std::fs::write(&config_path, pretty);
+        }
     }
 
     let bind_addr = format!("{}:{}", cfg.bind_ip, cfg.tcp_port);
@@ -139,11 +200,51 @@ async fn main() {
         .map(|a| a.to_string())
         .unwrap_or(bind_addr);
 
+    let mut admin_listener_opt = None;
+    let mut admin_bound_str = String::new();
+    if cfg.admin_enabled {
+        let adm_bind = format!("{}:{}", cfg.admin_bind_ip, cfg.admin_port);
+        match tokio::net::TcpListener::bind(&adm_bind).await {
+            Ok(al) => {
+                admin_bound_str = al
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or(adm_bind);
+                admin_listener_opt = Some(al);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DDNeo-Server] Warnung: Web-Admin konnte {} nicht binden: {}",
+                    adm_bind, e
+                );
+            }
+        }
+    }
+
     println!("==============================================================");
     println!("  DDNeo Dedicated Server v{}", env!("CARGO_PKG_VERSION"));
     println!("  Sitzung       : {}", cfg.session_name);
-    println!("  Lauscht auf   : {} (TCP)", actual_addr);
+    println!("  Spielserver   : {} (TCP)", actual_addr);
     println!("  Max. Spieler  : {}", cfg.max_players);
+    if !admin_bound_str.is_empty() {
+        println!(
+            "  Web-Admin     : http://{} (Benutzer: '{}')",
+            admin_bound_str, cfg.admin_username
+        );
+        if generated_initial_admin_pass {
+            println!(
+                "  Admin-Passwort: {} (in '{}' gespeichert!)",
+                cfg.admin_password, config_path
+            );
+        } else {
+            println!(
+                "  Admin-Login   : Passwort aus '{}' ('admin_password')",
+                config_path
+            );
+        }
+    } else {
+        println!("  Web-Admin     : Deaktiviert");
+    }
     println!(
         "  Leerlauf-Modus: {}",
         if cfg.pause_when_empty {
@@ -168,7 +269,8 @@ async fn main() {
         sig_stop.store(true, Ordering::Relaxed);
     });
 
-    run_server_on_listener(listener, cfg, stop_flag, online_count).await;
+    run_server_with_admin_listener(listener, admin_listener_opt, cfg, stop_flag, online_count)
+        .await;
 }
 
 #[cfg(unix)]

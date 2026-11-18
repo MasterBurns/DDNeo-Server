@@ -11,6 +11,6 @@ COPY --from=builder /build/target/release/ddneo-server /app/ddneo-server
 COPY server_config.example.json /app/server_config.json
 RUN mkdir -p /app/saves && chown -R ddneo:ddneo /app
 USER ddneo
-EXPOSE 27777/tcp
+EXPOSE 27777/tcp 27779/tcp
 VOLUME ["/app/saves"]
 ENTRYPOINT ["/app/ddneo-server", "--config", "/app/server_config.json"]

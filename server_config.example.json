@@ -11,5 +11,10 @@
   "save_interval_secs": 30,
   "world_save_path": "saves/server_world.bin",
   "status_json_path": "saves/server_status.json",
-  "ingame_day_real_secs": 1440.0
+  "ingame_day_real_secs": 1440.0,
+  "admin_enabled": true,
+  "admin_bind_ip": "0.0.0.0",
+  "admin_port": 27779,
+  "admin_username": "admin",
+  "admin_password": ""
 }

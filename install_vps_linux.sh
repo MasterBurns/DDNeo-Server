@@ -84,6 +84,7 @@ echo "[5/5] Aktiviere systemd-Dienst '${SERVICE_NAME}.service' ..."
 cp -f "${SCRIPT_DIR}/ddneo-server.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}.service"
+sleep 1
 
 echo ""
 echo "=============================================================="
@@ -95,6 +96,10 @@ echo "  Welt-Status JSON  : cat ${INSTALL_DIR}/saves/server_status.json"
 echo "  Konfiguration     : sudo nano ${INSTALL_DIR}/server_config.json"
 echo "                      (danach: sudo systemctl restart ${SERVICE_NAME})"
 echo ""
-echo "  WICHTIG — Firewall-Port 27777/TCP freigeben (falls aktiv):"
-echo "    Ubuntu/Debian (UFW): sudo ufw allow 27777/tcp"
+echo "  Web-Admin-Zugangsdaten (in ${INSTALL_DIR}/server_config.json):"
+grep -E '"admin_(port|username|password)"' "${INSTALL_DIR}/server_config.json" || true
+echo ""
+echo "  WICHTIG — Firewall-Ports freigeben (falls UFW aktiv):"
+echo "    sudo ufw allow 27777/tcp   # Spielserver"
+echo "    sudo ufw allow 27779/tcp   # Web-Admin-Oberfläche im Browser"
 echo "=============================================================="

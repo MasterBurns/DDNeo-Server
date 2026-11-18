@@ -31,9 +31,10 @@ cd ~/ddneo-server && git pull && sudo ./install_vps_linux.sh
 
 Das Skript prüft/installiert Rust automatisch, kompiliert `ddneo-server` exakt passend für das Linux-System des VPS nach `/opt/ddneo-server` und startet den dauerhaften `systemd`-Dienst `ddneo-server.service` (startet auch nach einem VPS-Reboot automatisch neu).
 
-**Port in der VPS-Firewall öffnen:**
+**Ports in der VPS-Firewall öffnen:**
 ```bash
-sudo ufw allow 27777/tcp
+sudo ufw allow 27777/tcp  # Spielserver (Pflicht)
+sudo ufw allow 27779/tcp  # Optional: Web-Admin-Oberfläche im Browser (http://DEINE_VPS_IP:27779)
 ```
 
 **Im Spiel verbinden:**
@@ -87,3 +88,8 @@ docker run -d --name ddneo-server --restart unless-stopped \
 | `password` | `""` | Optionales Beitritts-Passwort (leer = öffentlich) |
 | `pause_when_empty` | `true` | `true` = 0 % CPU & Weltzeit pausiert bei 0 Spielern |
 | `save_interval_secs` | `30` | Automatisches Speicherintervall in Sekunden |
+| `admin_enabled` | `true` | Aktiviert das eingebaute Web-Admin-Kontrollzentrum |
+| `admin_bind_ip` | `"0.0.0.0"` | Bind-Adresse für das Web-Admin-Panel (`"127.0.0.1"` für reinen SSH-Tunnel) |
+| `admin_port` | `27779` | HTTP-Port für das Web-Admin-Panel (`http://<IP>:27779`) |
+| `admin_username` | `"admin"` | Benutzername für den Login im Web-Admin-Panel |
+| `admin_password` | `"<zufällig>"` | Passwort für den Web-Login (wird beim ersten Start automatisch sicher generiert und in `server_config.json` gespeichert) |

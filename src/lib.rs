@@ -1,5 +1,7 @@
+pub mod admin;
+
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{
@@ -10,10 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SERVER_PORT: u16 = 27777;
 pub const LAN_DISCOVERY_PORT: u16 = 27778;
+pub const DEFAULT_ADMIN_HTTP_PORT: u16 = 27779;
 pub const DEFAULT_EMBEDDED_MAX_PLAYERS: u8 = 4;
 pub const DEFAULT_DEDICATED_MAX_PLAYERS: u8 = 12;
-pub const PROTOCOL_VERSION: u32 = 7;
-pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V7";
+pub const PROTOCOL_VERSION: u32 = 8;
+pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V8";
+pub const SERVER_CHUNK_MERC_SIZE: f64 = 1500.0;
 pub const AUTH_ACTION_HELLO: &str = "HELLO";
 pub const AUTH_ACTION_DELETE_CHAR: &str = "DELETE_CHARACTER";
 
@@ -160,6 +164,36 @@ pub fn merc_to_lat_lon_deg(mx: f64, my: f64) -> (f64, f64) {
     let lon = (mx / EARTH_RADIUS_M).to_degrees();
     let lat = (2.0 * (my / EARTH_RADIUS_M).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
     (lat, lon)
+}
+
+#[inline]
+pub fn lat_lon_deg_to_merc(lat: f64, lon: f64) -> (f64, f64) {
+    let clamped_lat = lat.clamp(-85.05112878, 85.05112878);
+    let lat_rad = clamped_lat.to_radians();
+    let lon_rad = lon.to_radians();
+    let mx = EARTH_RADIUS_M * lon_rad;
+    let my = EARTH_RADIUS_M * (std::f64::consts::FRAC_PI_4 + lat_rad * 0.5).tan().ln();
+    (mx, my)
+}
+
+/// Applies the authoritative server World Tier (`0..=50`) and fine Level Offset (`-20..=200`)
+/// to any deterministic Rift / Enemy base level without irreversible drift.
+#[inline]
+pub fn apply_world_difficulty_to_level(base_level: u32, world_tier: i32, level_offset: i32) -> u32 {
+    let b = base_level.max(1);
+    let tiered: i32 = if world_tier <= 0 {
+        ((b + 1) / 2).max(1) as i32
+    } else if world_tier == 1 {
+        b as i32
+    } else {
+        (b as i32).saturating_add((world_tier - 1).saturating_mul(3))
+    };
+    tiered.saturating_add(level_offset).clamp(1, 999) as u32
+}
+
+#[inline]
+pub fn compute_rift_floors_from_level(level: u32, id: u64) -> u32 {
+    3 + ((id as u32) % 2) + (level / 12).min(7)
 }
 
 /// Planet-scale canonical position.
@@ -366,6 +400,7 @@ pub struct WireOverworldRift {
     pub merc_y: f64,
     pub theme: String,
     pub color_rgba: [f32; 4],
+    pub base_level: u32,
     pub level: u32,
     pub max_floors: u32,
 }
@@ -594,6 +629,8 @@ pub enum NetServerMsg {
         max_players: u8,
         world_seed: u64,
         world_hour: f32,
+        world_tier: i32,
+        world_level_offset: i32,
         is_dedicated: bool,
         assigned_guild_id: Option<u64>,
         assigned_guild_role: PlayerGuildRole,
@@ -610,10 +647,27 @@ pub enum NetServerMsg {
     },
     WorldMacroSync {
         world_hour: f32,
+        world_tier: i32,
+        world_level_offset: i32,
         players: Vec<NetPlayerSnapshot>,
         character_directory: Vec<NetCharacterDirectoryEntry>,
         guilds: Vec<WirePlayerGuild>,
         all_vehicles: Vec<WireVehicle>,
+    },
+    AdminWorldReset {
+        new_world_seed: u64,
+        full_world_wipe: bool,
+        reset_chunks: Vec<(i32, i32)>,
+        unsealed_portals: Vec<u64>,
+        restored_buildings: Vec<u64>,
+        message: String,
+    },
+    AdminPlayerControl {
+        target_merc_x: Option<f64>,
+        target_merc_y: Option<f64>,
+        force_overworld: bool,
+        new_level: Option<u32>,
+        message: String,
     },
     GuildInviteReceived(NetGuildInvite),
     GuildRoleUpdated {
@@ -758,6 +812,18 @@ pub struct ServerConfig {
     pub status_json_path: Option<String>,
     #[serde(default = "default_day_secs")]
     pub ingame_day_real_secs: f32,
+    #[serde(default = "default_true")]
+    pub admin_enabled: bool,
+    #[serde(default = "default_bind_ip")]
+    pub admin_bind_ip: String,
+    #[serde(default = "default_admin_port")]
+    pub admin_port: u16,
+    #[serde(default = "default_admin_username")]
+    pub admin_username: String,
+    #[serde(default)]
+    pub admin_password: String,
+    #[serde(skip)]
+    pub config_file_path: Option<String>,
 }
 
 fn default_bind_ip() -> String {
@@ -765,6 +831,12 @@ fn default_bind_ip() -> String {
 }
 fn default_tcp_port() -> u16 {
     DEFAULT_SERVER_PORT
+}
+fn default_admin_port() -> u16 {
+    DEFAULT_ADMIN_HTTP_PORT
+}
+fn default_admin_username() -> String {
+    "admin".to_string()
 }
 fn default_dedicated_max() -> u8 {
     DEFAULT_DEDICATED_MAX_PLAYERS
@@ -807,12 +879,18 @@ impl Default for ServerConfig {
             world_save_path: default_world_save_path(),
             status_json_path: default_status_json_path(),
             ingame_day_real_secs: default_day_secs(),
+            admin_enabled: false,
+            admin_bind_ip: default_bind_ip(),
+            admin_port: default_admin_port(),
+            admin_username: default_admin_username(),
+            admin_password: String::new(),
+            config_file_path: None,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedServerWorld {
+struct PersistedServerWorldV2 {
     version: u32,
     world_seed: u64,
     world_hour: f32,
@@ -823,6 +901,47 @@ struct PersistedServerWorld {
     vehicles: Vec<WireVehicle>,
     sealed_portals: Vec<u64>,
     stabilized_portals: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedServerWorld {
+    version: u32,
+    world_seed: u64,
+    world_hour: f32,
+    world_tier: i32,
+    world_level_offset: i32,
+    next_guild_id: u64,
+    next_loot_id: u64,
+    characters: Vec<WireServerCharacter>,
+    guilds: Vec<WirePlayerGuild>,
+    vehicles: Vec<WireVehicle>,
+    sealed_portals: Vec<u64>,
+    stabilized_portals: Vec<u64>,
+}
+
+fn deserialize_persisted_world(bytes: &[u8]) -> Result<PersistedServerWorld, String> {
+    if bytes.len() >= 4 {
+        let ver = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if ver == 2 {
+            let v2 = bincode::deserialize::<PersistedServerWorldV2>(bytes)
+                .map_err(|e| e.to_string())?;
+            return Ok(PersistedServerWorld {
+                version: 3,
+                world_seed: v2.world_seed,
+                world_hour: v2.world_hour,
+                world_tier: 1,
+                world_level_offset: 0,
+                next_guild_id: v2.next_guild_id,
+                next_loot_id: v2.next_loot_id,
+                characters: v2.characters,
+                guilds: v2.guilds,
+                vehicles: v2.vehicles,
+                sealed_portals: v2.sealed_portals,
+                stabilized_portals: v2.stabilized_portals,
+            });
+        }
+    }
+    bincode::deserialize::<PersistedServerWorld>(bytes).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -847,16 +966,18 @@ struct LiveServerStatusJson<'a> {
 struct ConnectedPeer {
     uid: u64,
     tx: tokio::sync::mpsc::UnboundedSender<NetServerMsg>,
+    kick_tx: Option<tokio::sync::oneshot::Sender<()>>,
     snap: NetPlayerSnapshot,
     awaiting_creation: bool,
     reset_on_creation: bool,
+    peer_ip: String,
 }
 
 /// Inspects a persisted server world file (e.g. `saves/embedded_mp_world.bin`) without starting
 /// the server so the Main Menu OSM Map can immediately display the host's last saved server position.
 pub fn peek_saved_character_summary(save_path: &str, player_uid: u64) -> Option<ServerCharacterSummary> {
     let bytes = std::fs::read(save_path).ok()?;
-    let saved = bincode::deserialize::<PersistedServerWorld>(&bytes).ok()?;
+    let saved = deserialize_persisted_world(&bytes).ok()?;
     let ch = saved.characters.into_iter().find(|c| c.player_uid == player_uid)?;
     Some(ServerCharacterSummary {
         player_name: ch.player_name,
@@ -879,8 +1000,7 @@ pub fn delete_local_character_in_world_file(
         return Ok(None);
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mut saved =
-        bincode::deserialize::<PersistedServerWorld>(&bytes).map_err(|e| e.to_string())?;
+    let mut saved = deserialize_persisted_world(&bytes)?;
 
     let mut deleted_name = None;
     saved.characters.retain(|c| {
@@ -938,9 +1058,15 @@ struct ServerWorldHub {
     started_at: Instant,
     world_seed: u64,
     world_hour: f32,
+    world_tier: i32,
+    world_level_offset: i32,
     peers: HashMap<u64, ConnectedPeer>,
     characters: HashMap<u64, WireServerCharacter>,
     registered_pubkeys: HashMap<u64, [u8; 32]>,
+    player_meta: HashMap<u64, admin::PlayerAdminMeta>,
+    bans: Vec<admin::BanEntry>,
+    next_ban_id: u64,
+    recent_events: VecDeque<admin::AdminLogEntry>,
     guilds: HashMap<u64, WirePlayerGuild>,
     vehicles: HashMap<u64, WireVehicle>,
     dungeons: HashMap<u64, LiveDungeonInstance>,
@@ -963,9 +1089,15 @@ impl ServerWorldHub {
             started_at: Instant::now(),
             world_seed: rand::random::<u64>() | 1,
             world_hour: 14.0,
+            world_tier: 1,
+            world_level_offset: 0,
             peers: HashMap::new(),
             characters: HashMap::new(),
             registered_pubkeys: HashMap::new(),
+            player_meta: HashMap::new(),
+            bans: Vec::new(),
+            next_ban_id: 1,
+            recent_events: VecDeque::new(),
             guilds: HashMap::new(),
             vehicles: HashMap::new(),
             dungeons: HashMap::new(),
@@ -980,8 +1112,29 @@ impl ServerWorldHub {
             last_save_at: Instant::now(),
         };
         hub.load_from_disk_if_present();
+        hub.log_event(format!(
+            "Server '{}' gestartet auf Port {} (Seed {}, Weltstufe {}).",
+            hub.config.session_name, hub.bound_port, hub.world_seed, hub.world_tier
+        ));
         hub.write_status_json();
         hub
+    }
+
+    fn log_event(&mut self, text: String) {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let hh = (secs / 3600) % 24;
+        let mm = (secs / 60) % 60;
+        let ss = secs % 60;
+        if self.recent_events.len() >= 180 {
+            self.recent_events.pop_front();
+        }
+        self.recent_events.push_back(admin::AdminLogEntry {
+            time: format!("{:02}:{:02}:{:02} UTC", hh, mm, ss),
+            text,
+        });
     }
 
     fn load_from_disk_if_present(&mut self) {
@@ -998,6 +1151,22 @@ impl ServerWorldHub {
                 }
             }
         }
+        let bans_path_str = format!("{}.bans.json", path_str);
+        if let Ok(bans_txt) = std::fs::read_to_string(&bans_path_str) {
+            if let Ok(list) = serde_json::from_str::<Vec<admin::BanEntry>>(&bans_txt) {
+                for b in &list {
+                    self.next_ban_id = self.next_ban_id.max(b.ban_id + 1);
+                }
+                self.bans = list;
+            }
+        }
+        let meta_path_str = format!("{}.meta.json", path_str);
+        if let Ok(meta_txt) = std::fs::read_to_string(&meta_path_str) {
+            if let Ok(map) = serde_json::from_str::<HashMap<u64, admin::PlayerAdminMeta>>(&meta_txt)
+            {
+                self.player_meta = map;
+            }
+        }
         let path = Path::new(path_str);
         if !path.exists() {
             self.dirty = true;
@@ -1005,7 +1174,7 @@ impl ServerWorldHub {
             return;
         }
         match std::fs::read(path) {
-            Ok(bytes) => match bincode::deserialize::<PersistedServerWorld>(&bytes) {
+            Ok(bytes) => match deserialize_persisted_world(&bytes) {
                 Ok(saved) => {
                     self.world_seed = if saved.world_seed == 0 {
                         rand::random::<u64>() | 1
@@ -1013,6 +1182,8 @@ impl ServerWorldHub {
                         saved.world_seed
                     };
                     self.world_hour = saved.world_hour.rem_euclid(24.0);
+                    self.world_tier = saved.world_tier.clamp(0, 50);
+                    self.world_level_offset = saved.world_level_offset.clamp(-20, 200);
                     self.next_guild_id = saved.next_guild_id.max(1);
                     self.next_loot_id = saved.next_loot_id.max(1);
                     for ch in saved.characters {
@@ -1034,13 +1205,14 @@ impl ServerWorldHub {
                     self.stabilized_portals = saved.stabilized_portals.into_iter().collect();
                     if self.config.is_dedicated {
                         println!(
-                            "[DDNeo-Server] Weltstatus geladen aus '{}': {} Charaktere ({} Schlüssel gebunden), {} Gilden, {} Fahrzeuge, {} Risse versiegelt (Seed {}).",
+                            "[DDNeo-Server] Weltstatus geladen aus '{}': {} Charaktere ({} Schlüssel, {} Sperren), {} Gilden, {} Fahrzeuge, Weltstufe {} (Seed {}).",
                             path_str,
                             self.characters.len(),
                             self.registered_pubkeys.len(),
+                            self.bans.len(),
                             self.guilds.len(),
                             self.vehicles.len(),
-                            self.sealed_portals.len(),
+                            self.world_tier,
                             self.world_seed
                         );
                     }
@@ -1061,6 +1233,26 @@ impl ServerWorldHub {
         }
     }
 
+    fn save_bans_and_meta(&self) {
+        let Some(ref path_str) = self.config.world_save_path else {
+            return;
+        };
+        if let Ok(bans_json) = serde_json::to_string_pretty(&self.bans) {
+            let bp = format!("{}.bans.json", path_str);
+            let btmp = format!("{}.bans.json.tmp", path_str);
+            if std::fs::write(&btmp, bans_json).is_ok() {
+                let _ = std::fs::rename(&btmp, &bp);
+            }
+        }
+        if let Ok(meta_json) = serde_json::to_string_pretty(&self.player_meta) {
+            let mp = format!("{}.meta.json", path_str);
+            let mtmp = format!("{}.meta.json.tmp", path_str);
+            if std::fs::write(&mtmp, meta_json).is_ok() {
+                let _ = std::fs::rename(&mtmp, &mp);
+            }
+        }
+    }
+
     fn save_if_needed(&mut self, force: bool) {
         let interval = Duration::from_secs(self.config.save_interval_secs.max(5));
         if !force && (!self.dirty || self.last_save_at.elapsed() < interval) {
@@ -1077,9 +1269,11 @@ impl ServerWorldHub {
             }
         }
         let snap = PersistedServerWorld {
-            version: 2,
+            version: 3,
             world_seed: self.world_seed,
             world_hour: self.world_hour,
+            world_tier: self.world_tier,
+            world_level_offset: self.world_level_offset,
             next_guild_id: self.next_guild_id,
             next_loot_id: self.next_loot_id,
             characters: self.characters.values().cloned().collect(),
@@ -1108,6 +1302,7 @@ impl ServerWorldHub {
                 let _ = std::fs::rename(&keys_tmp, &keys_path);
             }
         }
+        self.save_bans_and_meta();
         self.write_status_json();
     }
 
@@ -2078,6 +2273,17 @@ impl ServerWorldHub {
                 if rifts.len() > 8 {
                     rifts.truncate(8);
                 }
+                for r in &mut rifts {
+                    if r.base_level == 0 {
+                        r.base_level = r.level.max(1);
+                    }
+                    r.level = apply_world_difficulty_to_level(
+                        r.base_level,
+                        self.world_tier,
+                        self.world_level_offset,
+                    );
+                    r.max_floors = compute_rift_floors_from_level(r.level, r.id);
+                }
                 let key = (chunk_x, chunk_y);
                 let should_adopt = match self.chunk_rifts.get(&key) {
                     None => true,
@@ -2132,9 +2338,11 @@ impl ServerWorldHub {
                     .get(&uid)
                     .map(|p| p.snap.name.clone())
                     .unwrap_or_else(|| "Jäger".to_string());
+                let clipped: String = clean.chars().take(240).collect();
+                self.log_event(format!("[Chat] {}: {}", sender, clipped));
                 self.broadcast_all(&NetServerMsg::ChatBroadcast {
                     sender,
-                    text: clean.chars().take(240).collect(),
+                    text: clipped,
                     is_system: false,
                 });
             }
@@ -2273,6 +2481,8 @@ impl ServerWorldHub {
         let all_vehicles: Vec<WireVehicle> = self.vehicles.values().cloned().collect();
         let msg = NetServerMsg::WorldMacroSync {
             world_hour: self.world_hour,
+            world_tier: self.world_tier,
+            world_level_offset: self.world_level_offset,
             players,
             character_directory,
             guilds,
@@ -2291,6 +2501,1151 @@ impl ServerWorldHub {
         self.publish_macro_sync();
         self.save_if_needed(false);
     }
+
+    fn check_ban_reason(
+        &self,
+        player_uid: u64,
+        pubkey: &[u8; 32],
+        peer_ip: &str,
+    ) -> Option<String> {
+        let pk_hex = if *pubkey == [0u8; 32] {
+            String::new()
+        } else {
+            bytes32_to_hex(pubkey)
+        };
+        let fp = if *pubkey == [0u8; 32] {
+            String::new()
+        } else {
+            format_pubkey_fingerprint(pubkey)
+        };
+        for b in &self.bans {
+            let match_pk = !pk_hex.is_empty()
+                && !b.pubkey_hex.is_empty()
+                && b.pubkey_hex.eq_ignore_ascii_case(&pk_hex);
+            let match_fp = !fp.is_empty()
+                && !b.device_fingerprint.is_empty()
+                && b.device_fingerprint.eq_ignore_ascii_case(&fp);
+            let match_uid = b.player_uid == Some(player_uid);
+            let match_ip = !peer_ip.is_empty()
+                && b.ip_address
+                    .as_deref()
+                    .map_or(false, |bip| !bip.is_empty() && bip == peer_ip);
+            if match_pk || match_fp || match_uid || match_ip {
+                let id_lbl = if !fp.is_empty() {
+                    fp
+                } else {
+                    format!("UID {}", player_uid)
+                };
+                return Some(format!(
+                    "Dein Gerät ({}) ist auf diesem Server gesperrt. Grund: {}",
+                    id_lbl,
+                    if b.reason.is_empty() {
+                        "Vom Administrator gesperrt"
+                    } else {
+                        &b.reason
+                    }
+                ));
+            }
+        }
+        None
+    }
+
+    fn kick_peer_immediately(
+        &mut self,
+        uid: u64,
+        reason: &str,
+        online_count: &Arc<AtomicUsize>,
+    ) -> bool {
+        self.release_player_vehicle_seats(uid);
+        if let Some(mut peer) = self.peers.remove(&uid) {
+            for g in self.guilds.values_mut() {
+                for m in &mut g.members {
+                    if m.uid == uid {
+                        m.online = false;
+                    }
+                }
+            }
+            let _ = peer.tx.send(NetServerMsg::Rejected {
+                reason: reason.to_string(),
+            });
+            drop(peer.tx);
+            if let Some(ktx) = peer.kick_tx.take() {
+                let _ = ktx.send(());
+            }
+            online_count.store(self.peers.len(), Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn recalculate_all_cached_rifts(&mut self) {
+        let tier = self.world_tier;
+        let offset = self.world_level_offset;
+        for (_, rifts) in self.chunk_rifts.values_mut() {
+            for r in rifts.iter_mut() {
+                if r.base_level == 0 {
+                    r.base_level = r.level.max(1);
+                }
+                r.level = apply_world_difficulty_to_level(r.base_level, tier, offset);
+                r.max_floors = compute_rift_floors_from_level(r.level, r.id);
+            }
+        }
+        let coords: Vec<(i32, i32)> = self.chunk_rifts.keys().copied().collect();
+        for (cx, cy) in coords {
+            if let Some(sync_msg) = self.build_chunk_rifts_sync_msg(cx, cy) {
+                self.broadcast_all(&sync_msg);
+            }
+        }
+    }
+
+    fn backup_dir_path(&self) -> Option<std::path::PathBuf> {
+        let path_str = self.config.world_save_path.as_ref()?;
+        let p = Path::new(path_str);
+        let parent = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Some(parent.join("backups"))
+    }
+
+    fn create_world_backup(&mut self, label: &str) -> Result<String, String> {
+        self.dirty = true;
+        self.save_if_needed(true);
+        let Some(ref src_str) = self.config.world_save_path else {
+            return Err("Kein 'world_save_path' konfiguriert.".to_string());
+        };
+        let bdir = self
+            .backup_dir_path()
+            .ok_or_else(|| "Kein Backup-Pfad verfügbar.".to_string())?;
+        std::fs::create_dir_all(&bdir).map_err(|e| e.to_string())?;
+        let unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let safe_lbl: String = label
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(24)
+            .collect();
+        let fname = if safe_lbl.is_empty() {
+            format!("world_snapshot_{}.bin", unix_s)
+        } else {
+            format!("world_snapshot_{}_{}.bin", unix_s, safe_lbl)
+        };
+        let dst = bdir.join(&fname);
+        std::fs::copy(src_str, &dst).map_err(|e| format!("Backup fehlgeschlagen: {}", e))?;
+        Ok(fname)
+    }
+
+    fn list_world_backups(&self) -> Vec<admin::AdminBackupRow> {
+        let Some(bdir) = self.backup_dir_path() else {
+            return Vec::new();
+        };
+        let Ok(rd) = std::fs::read_dir(bdir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for ent in rd.flatten() {
+            let fname = ent.file_name().to_string_lossy().to_string();
+            if !fname.ends_with(".bin") {
+                continue;
+            }
+            if let Ok(md) = ent.metadata() {
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                out.push(admin::AdminBackupRow {
+                    filename: fname,
+                    size_bytes: md.len(),
+                    modified_unix: mtime,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix));
+        out
+    }
+
+    fn build_admin_dashboard(&self) -> admin::AdminDashboardState {
+        let role_label_of = |rid: u8| -> &'static str {
+            match rid {
+                0 => "Tank",
+                1 => "Fernkampf",
+                2 => "Nahkampf",
+                3 => "Heiler",
+                4 => "Magier",
+                _ => "Jäger",
+            }
+        };
+
+        let mut all_uids: HashSet<u64> = self.characters.keys().copied().collect();
+        for (&uid, p) in &self.peers {
+            if !p.awaiting_creation {
+                all_uids.insert(uid);
+            }
+        }
+
+        let mut characters = Vec::with_capacity(all_uids.len());
+        for uid in all_uids {
+            let peer_opt = self.peers.get(&uid).filter(|p| !p.awaiting_creation);
+            let ch_opt = self.characters.get(&uid);
+            let name = peer_opt
+                .map(|p| p.snap.name.clone())
+                .or_else(|| ch_opt.map(|c| c.player_name.clone()))
+                .unwrap_or_else(|| format!("UID {}", uid));
+            let level = peer_opt
+                .map(|p| p.snap.level)
+                .or_else(|| ch_opt.map(|c| c.level))
+                .unwrap_or(1);
+            let role_id = peer_opt
+                .map(|p| p.snap.role_id)
+                .or_else(|| ch_opt.map(|c| c.role_id))
+                .unwrap_or(0);
+
+            let (mx, my, dim_txt) = if let Some(p) = peer_opt {
+                match p.snap.net_pos {
+                    NetWorldPos::Overworld { merc_x, merc_y } => {
+                        (merc_x, merc_y, "Oberwelt".to_string())
+                    }
+                    NetWorldPos::BuildingInterior { building_id, .. } => {
+                        let (fb_x, fb_y) = ch_opt
+                            .map(|c| (c.last_merc_x, c.last_merc_y))
+                            .unwrap_or((0.0, 0.0));
+                        (fb_x, fb_y, format!("Gebäude #{}", building_id))
+                    }
+                    NetWorldPos::Dungeon {
+                        seed,
+                        floor,
+                        max_floors,
+                        ..
+                    } => {
+                        let (fb_x, fb_y) = ch_opt
+                            .map(|c| (c.last_merc_x, c.last_merc_y))
+                            .unwrap_or((0.0, 0.0));
+                        (
+                            fb_x,
+                            fb_y,
+                            format!("Riss-Dungeon #{} (Etage {}/{})", seed, floor, max_floors),
+                        )
+                    }
+                }
+            } else if let Some(c) = ch_opt {
+                (c.last_merc_x, c.last_merc_y, "Oberwelt (Gespeichert)".to_string())
+            } else {
+                (0.0, 0.0, "Unbekannt".to_string())
+            };
+
+            let (lat, lon) = merc_to_lat_lon_deg(mx, my);
+            let ginfo = self.find_player_guild(uid);
+            let pk_opt = self.registered_pubkeys.get(&uid);
+            let pubkey_hex = pk_opt.map(bytes32_to_hex).unwrap_or_default();
+            let meta = self.player_meta.get(&uid);
+            let device_fingerprint = pk_opt
+                .map(format_pubkey_fingerprint)
+                .or_else(|| meta.map(|m| m.device_fingerprint.clone()))
+                .unwrap_or_default();
+            let last_ip = peer_opt
+                .map(|p| p.peer_ip.clone())
+                .or_else(|| meta.map(|m| m.last_ip.clone()))
+                .unwrap_or_default();
+            let last_seen_unix = if peer_opt.is_some() {
+                current_unix_ms() / 1000
+            } else {
+                meta.map(|m| m.last_seen_unix_secs).unwrap_or(0)
+            };
+
+            characters.push(admin::AdminCharacterRow {
+                uid,
+                name,
+                level,
+                role_label: role_label_of(role_id).to_string(),
+                online: peer_opt.is_some(),
+                guild_name: ginfo.as_ref().map(|(_, _, n)| n.clone()).unwrap_or_default(),
+                guild_role: ginfo
+                    .as_ref()
+                    .map(|(_, r, _)| r.label_de().to_string())
+                    .unwrap_or_default(),
+                dimension: dim_txt,
+                lat,
+                lon,
+                device_fingerprint,
+                pubkey_hex,
+                last_ip,
+                last_seen_unix,
+            });
+        }
+        characters.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| b.level.cmp(&a.level)));
+
+        let mut guilds: Vec<admin::AdminGuildRow> = self
+            .guilds
+            .values()
+            .map(|g| {
+                let hostile_wars = g
+                    .stances
+                    .values()
+                    .filter(|&&s| s == PlayerGuildStance::Hostile)
+                    .count();
+                let bases = g
+                    .bases
+                    .iter()
+                    .map(|b| {
+                        let (lat, lon) = merc_to_lat_lon_deg(b.door_merc_x, b.door_merc_y);
+                        admin::AdminBaseRow {
+                            building_id: b.building_id,
+                            name: b.name.clone(),
+                            module_count: b.module_count,
+                            lat,
+                            lon,
+                        }
+                    })
+                    .collect();
+                admin::AdminGuildRow {
+                    guild_id: g.guild_id,
+                    name: g.name.clone(),
+                    founder_name: g.founder_name.clone(),
+                    member_count: g.members.len(),
+                    hostile_wars,
+                    bases,
+                }
+            })
+            .collect();
+        guilds.sort_by_key(|g| g.guild_id);
+
+        let mut vehicles: Vec<admin::AdminVehicleRow> = self
+            .vehicles
+            .values()
+            .map(|v| {
+                let (lat, lon) = merc_to_lat_lon_deg(v.merc_x, v.merc_y);
+                let owner_label = if let Some(gid) = v.guild_id {
+                    self.guilds
+                        .get(&gid)
+                        .map(|g| format!("Gilde '{}'", g.name))
+                        .unwrap_or_else(|| format!("Gilde #{}", gid))
+                } else {
+                    self.characters
+                        .get(&v.owner_uid)
+                        .map(|c| format!("Spieler '{}'", c.player_name))
+                        .unwrap_or_else(|| format!("UID {}", v.owner_uid))
+                };
+                admin::AdminVehicleRow {
+                    vehicle_id: v.vehicle_id,
+                    label_de: v.label_de.clone(),
+                    owner_label,
+                    fuel_liters: v.fuel_liters,
+                    body_pct: v.body_pct,
+                    tires_pct: v.tires_pct,
+                    driver_uid: v.driver_uid,
+                    passenger_count: v.passengers.len(),
+                    lat,
+                    lon,
+                }
+            })
+            .collect();
+        vehicles.sort_by_key(|v| v.vehicle_id);
+
+        let mut rifts_preview = Vec::new();
+        for (_, rifts) in self.chunk_rifts.values() {
+            for r in rifts {
+                if self.sealed_portals.contains(&r.id) {
+                    continue;
+                }
+                let (lat, lon) = merc_to_lat_lon_deg(r.merc_x, r.merc_y);
+                rifts_preview.push(admin::AdminRiftPin {
+                    id: r.id,
+                    level: r.level,
+                    theme: r.theme.clone(),
+                    lat,
+                    lon,
+                });
+                if rifts_preview.len() >= 250 {
+                    break;
+                }
+            }
+            if rifts_preview.len() >= 250 {
+                break;
+            }
+        }
+
+        let active_online = self.peers.values().filter(|p| !p.awaiting_creation).count();
+        admin::AdminDashboardState {
+            session_name: self.config.session_name.clone(),
+            tcp_port: self.bound_port,
+            online_players: active_online,
+            max_players: self.config.max_players,
+            server_password: self.config.password.clone(),
+            pause_when_empty: self.config.pause_when_empty,
+            hibernating: self.peers.is_empty() && self.config.pause_when_empty,
+            world_seed: self.world_seed,
+            world_hour: self.world_hour,
+            ingame_day_real_secs: self.config.ingame_day_real_secs,
+            world_tier: self.world_tier,
+            world_level_offset: self.world_level_offset,
+            sample_min_rift_level: apply_world_difficulty_to_level(
+                2,
+                self.world_tier,
+                self.world_level_offset,
+            ),
+            sample_max_rift_level: apply_world_difficulty_to_level(
+                14,
+                self.world_tier,
+                self.world_level_offset,
+            ),
+            cached_rift_chunks: self.chunk_rifts.len(),
+            sealed_portal_count: self.sealed_portals.len(),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            characters,
+            bans: self.bans.clone(),
+            guilds,
+            vehicles,
+            rifts_preview,
+            backups: self.list_world_backups(),
+            recent_events: self.recent_events.iter().cloned().collect(),
+        }
+    }
+
+    fn execute_admin_command(
+        &mut self,
+        cmd: admin::AdminCommand,
+        online_count: &Arc<AtomicUsize>,
+    ) -> Result<admin::AdminActionReply, String> {
+        use admin::AdminCommand;
+        let msg = match cmd {
+            AdminCommand::GetDashboard => String::new(),
+            AdminCommand::ForceSave => {
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.log_event("[Admin] Manuelle Weltspeicherung ausgeführt.".to_string());
+                "Weltstatus wurde sofort auf die Festplatte gespeichert.".to_string()
+            }
+            AdminCommand::SetWorldDifficulty {
+                world_tier,
+                world_level_offset,
+            } => {
+                self.world_tier = world_tier.clamp(0, 50);
+                self.world_level_offset = world_level_offset.clamp(-20, 200);
+                self.dirty = true;
+                self.recalculate_all_cached_rifts();
+                self.publish_macro_sync();
+                self.save_if_needed(true);
+                let announce = format!(
+                    "Weltstufe wurde vom Administrator auf Stufe {}{} angepasst!",
+                    self.world_tier,
+                    if self.world_level_offset != 0 {
+                        format!(" (Offset {:+})", self.world_level_offset)
+                    } else {
+                        String::new()
+                    }
+                );
+                self.log_event(format!("[Admin] {}", announce));
+                self.broadcast_all(&NetServerMsg::ChatBroadcast {
+                    sender: "Admin".to_string(),
+                    text: announce.clone(),
+                    is_system: true,
+                });
+                announce
+            }
+            AdminCommand::SetWorldTime {
+                world_hour,
+                ingame_day_real_secs,
+            } => {
+                self.world_hour = world_hour.rem_euclid(24.0);
+                if let Some(ds) = ingame_day_real_secs {
+                    self.config.ingame_day_real_secs = ds.clamp(60.0, 86_400.0);
+                    if let Some(ref cfg_p) = self.config.config_file_path {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&self.config) {
+                            let _ = std::fs::write(cfg_p, pretty);
+                        }
+                    }
+                }
+                self.dirty = true;
+                self.publish_macro_sync();
+                self.save_if_needed(true);
+                let m = format!(
+                    "Weltzeit auf {:02}:{:02} Uhr gesetzt.",
+                    self.world_hour as u32,
+                    ((self.world_hour.fract()) * 60.0) as u32
+                );
+                self.log_event(format!("[Admin] {}", m));
+                m
+            }
+            AdminCommand::UpdateServerSettings {
+                session_name,
+                max_players,
+                password,
+                pause_when_empty,
+            } => {
+                if !session_name.trim().is_empty() {
+                    self.config.session_name = session_name.trim().to_string();
+                }
+                self.config.max_players = max_players.clamp(2, 64);
+                self.config.password = password;
+                self.config.pause_when_empty = pause_when_empty;
+                if let Some(ref cfg_p) = self.config.config_file_path {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&self.config) {
+                        let _ = std::fs::write(cfg_p, pretty);
+                    }
+                }
+                self.write_status_json();
+                self.log_event(format!(
+                    "[Admin] Servereinstellungen aktualisiert ('{}', max. {} Spieler).",
+                    self.config.session_name, self.config.max_players
+                ));
+                "Servereinstellungen live übernommen und gespeichert.".to_string()
+            }
+            AdminCommand::BroadcastMessage { text } => {
+                let clean: String = text.trim().chars().take(280).collect();
+                if clean.is_empty() {
+                    return Err("Nachricht darf nicht leer sein.".to_string());
+                }
+                self.log_event(format!("[Admin-Durchsage] {}", clean));
+                self.broadcast_all(&NetServerMsg::ChatBroadcast {
+                    sender: "Administrator".to_string(),
+                    text: clean,
+                    is_system: true,
+                });
+                "System-Durchsage an alle Spieler gesendet.".to_string()
+            }
+            AdminCommand::KickPlayer { player_uid, reason } => {
+                let why = if reason.trim().is_empty() {
+                    "Vom Server-Administrator getrennt."
+                } else {
+                    reason.trim()
+                };
+                if self.kick_peer_immediately(player_uid, why, online_count) {
+                    self.publish_macro_sync();
+                    self.write_status_json();
+                    self.log_event(format!(
+                        "[Admin] Spieler UID {} gekickt ({}).",
+                        player_uid, why
+                    ));
+                    format!("Spieler (UID {}) wurde getrennt.", player_uid)
+                } else {
+                    "Spieler ist aktuell nicht online.".to_string()
+                }
+            }
+            AdminCommand::BanDevice {
+                player_uid,
+                mut pubkey_hex,
+                mut device_fingerprint,
+                mut ip_address,
+                mut player_name,
+                reason,
+                delete_character,
+            } => {
+                if let Some(uid) = player_uid {
+                    if pubkey_hex.is_empty() {
+                        if let Some(pk) = self.registered_pubkeys.get(&uid) {
+                            pubkey_hex = bytes32_to_hex(pk);
+                            device_fingerprint = format_pubkey_fingerprint(pk);
+                        }
+                    }
+                    if player_name.is_empty() {
+                        if let Some(ch) = self.characters.get(&uid) {
+                            player_name = ch.player_name.clone();
+                        }
+                    }
+                    if ip_address.is_none() {
+                        ip_address = self
+                            .peers
+                            .get(&uid)
+                            .map(|p| p.peer_ip.clone())
+                            .or_else(|| self.player_meta.get(&uid).map(|m| m.last_ip.clone()))
+                            .filter(|s| !s.is_empty());
+                    }
+                }
+                if device_fingerprint.is_empty() && !pubkey_hex.is_empty() {
+                    if let Some(pk) = hex_to_bytes32(&pubkey_hex) {
+                        device_fingerprint = format_pubkey_fingerprint(&pk);
+                    }
+                }
+                if pubkey_hex.is_empty()
+                    && device_fingerprint.is_empty()
+                    && player_uid.is_none()
+                    && ip_address.is_none()
+                {
+                    return Err("Keine gültige Device-ID, UID oder IP zum Sperren angegeben.".to_string());
+                }
+
+                let ban_id = self.next_ban_id;
+                self.next_ban_id += 1;
+                let clean_reason = if reason.trim().is_empty() {
+                    "Vom Administrator gesperrt".to_string()
+                } else {
+                    reason.trim().to_string()
+                };
+                let entry = admin::BanEntry {
+                    ban_id,
+                    device_fingerprint: device_fingerprint.clone(),
+                    pubkey_hex: pubkey_hex.to_lowercase(),
+                    player_uid,
+                    ip_address,
+                    player_name: player_name.clone(),
+                    reason: clean_reason.clone(),
+                    banned_at_unix_secs: current_unix_ms() / 1000,
+                };
+                self.bans.push(entry);
+
+                // Immediately kick any connected session matching this Device-ID / UID / IP!
+                let matching_online: Vec<u64> = self
+                    .peers
+                    .iter()
+                    .filter_map(|(&uid, peer)| {
+                        let pk = self.registered_pubkeys.get(&uid).copied().unwrap_or([0u8; 32]);
+                        if self.check_ban_reason(uid, &pk, &peer.peer_ip).is_some() {
+                            Some(uid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for kuid in matching_online {
+                    let msg = format!(
+                        "Dein Gerät wurde vom Administrator gesperrt: {}",
+                        clean_reason
+                    );
+                    self.kick_peer_immediately(kuid, &msg, online_count);
+                }
+
+                if delete_character {
+                    if let Some(uid) = player_uid {
+                        self.purge_character_for_reset(uid);
+                    }
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                let label = if !device_fingerprint.is_empty() {
+                    device_fingerprint
+                } else {
+                    player_name.clone()
+                };
+                self.log_event(format!(
+                    "[Admin] Gerät/Spieler '{}' gesperrt (Ban #{}, Grund: {}).",
+                    label, ban_id, clean_reason
+                ));
+                format!("Sperre #{} für '{}' aktiviert.", ban_id, label)
+            }
+            AdminCommand::UnbanDevice { ban_id } => {
+                let before = self.bans.len();
+                self.bans.retain(|b| b.ban_id != ban_id);
+                if self.bans.len() == before {
+                    return Err("Sperreintrag nicht gefunden.".to_string());
+                }
+                self.save_bans_and_meta();
+                self.log_event(format!("[Admin] Gerätesperre #{} aufgehoben.", ban_id));
+                format!("Sperre #{} wurde aufgehoben.", ban_id)
+            }
+            AdminCommand::TeleportOrUnstuckPlayer {
+                player_uid,
+                lat,
+                lon,
+                unstuck_to_overworld,
+            } => {
+                let target_merc = match (lat, lon) {
+                    (Some(la), Some(lo)) => {
+                        let (mx, my) = lat_lon_deg_to_merc(la, lo);
+                        Some((mx, my, la, lo))
+                    }
+                    _ => None,
+                };
+
+                let mut updated = false;
+                if let Some(ch) = self.characters.get_mut(&player_uid) {
+                    if let Some((mx, my, la, lo)) = target_merc {
+                        ch.last_merc_x = mx;
+                        ch.last_merc_y = my;
+                        if let Ok(mut jv) =
+                            serde_json::from_slice::<serde_json::Value>(&ch.character_bincode)
+                        {
+                            if let Some(obj) = jv.as_object_mut() {
+                                obj.insert("last_lat".to_string(), serde_json::json!(la));
+                                obj.insert("last_lon".to_string(), serde_json::json!(lo));
+                                obj.insert("saved_pos_x".to_string(), serde_json::json!(0.0));
+                                obj.insert("saved_pos_y".to_string(), serde_json::json!(0.0));
+                                obj.insert("has_saved_pos".to_string(), serde_json::json!(true));
+                            }
+                            if let Ok(new_bytes) = serde_json::to_vec(&jv) {
+                                ch.character_bincode = new_bytes;
+                            }
+                        }
+                    }
+                    updated = true;
+                }
+
+                self.release_player_vehicle_seats(player_uid);
+                if let Some(peer) = self.peers.get_mut(&player_uid) {
+                    let (dest_mx, dest_my) = if let Some((mx, my, _, _)) = target_merc {
+                        (mx, my)
+                    } else if let Some(ch) = self.characters.get(&player_uid) {
+                        (ch.last_merc_x, ch.last_merc_y)
+                    } else if let NetWorldPos::Overworld { merc_x, merc_y } = peer.snap.net_pos {
+                        (merc_x, merc_y)
+                    } else {
+                        lat_lon_deg_to_merc(52.5200, 13.4050)
+                    };
+                    peer.snap.net_pos = NetWorldPos::Overworld {
+                        merc_x: dest_mx,
+                        merc_y: dest_my,
+                    };
+                    peer.snap.driving_vehicle_id = None;
+                    peer.snap.riding_vehicle_id = None;
+                    let note = if target_merc.is_some() {
+                        "Du wurdest vom Server-Administrator teleportiert.".to_string()
+                    } else {
+                        "Du wurdest vom Server-Administrator auf die Oberwelt gerettet (Unstuck)."
+                            .to_string()
+                    };
+                    let _ = peer.tx.send(NetServerMsg::AdminPlayerControl {
+                        target_merc_x: Some(dest_mx),
+                        target_merc_y: Some(dest_my),
+                        force_overworld: unstuck_to_overworld || target_merc.is_some(),
+                        new_level: None,
+                        message: note,
+                    });
+                    updated = true;
+                }
+
+                if !updated {
+                    return Err("Spieler/Charakter nicht gefunden.".to_string());
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                let m = if let Some((_, _, la, lo)) = target_merc {
+                    format!(
+                        "Spieler UID {} nach ({:.4}°, {:.4}°) versetzt.",
+                        player_uid, la, lo
+                    )
+                } else {
+                    format!("Spieler UID {} auf sichere Oberwelt gerettet.", player_uid)
+                };
+                self.log_event(format!("[Admin] {}", m));
+                m
+            }
+            AdminCommand::SetCharacterLevel {
+                player_uid,
+                new_level,
+            } => {
+                let lvl = new_level.clamp(1, 500);
+                let mut found_name = None;
+                if let Some(ch) = self.characters.get_mut(&player_uid) {
+                    ch.level = lvl;
+                    found_name = Some(ch.player_name.clone());
+                    if let Ok(mut jv) =
+                        serde_json::from_slice::<serde_json::Value>(&ch.character_bincode)
+                    {
+                        if let Some(obj) = jv.as_object_mut() {
+                            obj.insert("level".to_string(), serde_json::json!(lvl));
+                        }
+                        if let Ok(new_bytes) = serde_json::to_vec(&jv) {
+                            ch.character_bincode = new_bytes;
+                        }
+                    }
+                }
+                if let Some(peer) = self.peers.get_mut(&player_uid) {
+                    peer.snap.level = lvl;
+                    if found_name.is_none() {
+                        found_name = Some(peer.snap.name.clone());
+                    }
+                    let _ = peer.tx.send(NetServerMsg::AdminPlayerControl {
+                        target_merc_x: None,
+                        target_merc_y: None,
+                        force_overworld: false,
+                        new_level: Some(lvl),
+                        message: format!(
+                            "Deine Charakterstufe wurde vom Administrator auf Stufe {} gesetzt.",
+                            lvl
+                        ),
+                    });
+                }
+                let Some(cname) = found_name else {
+                    return Err("Charakter nicht gefunden.".to_string());
+                };
+                for g in self.guilds.values_mut() {
+                    for m in &mut g.members {
+                        if m.uid == player_uid {
+                            m.level = lvl;
+                        }
+                    }
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                let m = format!("Stufe von '{}' auf Stufe {} gesetzt.", cname, lvl);
+                self.log_event(format!("[Admin] {}", m));
+                m
+            }
+            AdminCommand::DeleteCharacter { player_uid } => {
+                let cname = self
+                    .characters
+                    .get(&player_uid)
+                    .map(|c| c.player_name.clone())
+                    .unwrap_or_else(|| format!("UID {}", player_uid));
+                self.kick_peer_immediately(
+                    player_uid,
+                    "Dein Charakter wurde vom Server-Administrator gelöscht.",
+                    online_count,
+                );
+                self.purge_character_for_reset(player_uid);
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                let m = format!("Charakter '{}' (UID {}) gelöscht.", cname, player_uid);
+                self.log_event(format!("[Admin] {}", m));
+                m
+            }
+            AdminCommand::ResetArea {
+                lat,
+                lon,
+                radius_km,
+                reset_rifts,
+                restore_buildings,
+                remove_vehicles,
+                remove_bases,
+            } => {
+                let r_km = radius_km.clamp(0.2, 100.0);
+                let (center_mx, center_my) = lat_lon_deg_to_merc(lat, lon);
+                let meter_scale = lat.clamp(-80.0, 80.0).to_radians().cos().max(0.15);
+                let radius_m = r_km * 1000.0;
+                let merc_rad = radius_m / meter_scale;
+                let in_radius = |mx: f64, my: f64| -> bool {
+                    ((mx - center_mx) * meter_scale).hypot((my - center_my) * meter_scale)
+                        <= radius_m
+                };
+
+                let cx_min = ((center_mx - merc_rad) / SERVER_CHUNK_MERC_SIZE).floor() as i32;
+                let cx_max = ((center_mx + merc_rad) / SERVER_CHUNK_MERC_SIZE).floor() as i32;
+                let cy_min = ((center_my - merc_rad) / SERVER_CHUNK_MERC_SIZE).floor() as i32;
+                let cy_max = ((center_my + merc_rad) / SERVER_CHUNK_MERC_SIZE).floor() as i32;
+
+                let mut reset_chunks = Vec::new();
+                let mut unsealed_portals = Vec::new();
+                let mut restored_buildings = Vec::new();
+
+                if reset_rifts {
+                    for cx in cx_min..=cx_max {
+                        for cy in cy_min..=cy_max {
+                            if let Some((_, rifts)) = self.chunk_rifts.remove(&(cx, cy)) {
+                                for r in rifts {
+                                    self.sealed_portals.remove(&r.id);
+                                    self.stabilized_portals.remove(&r.id);
+                                    self.dungeons.remove(&r.id);
+                                    self.overworld_rift_kills.remove(&r.id);
+                                    self.dormant_overworld_portals.remove(&r.id);
+                                    unsealed_portals.push(r.id);
+                                }
+                            }
+                            if reset_chunks.len() < 4096 {
+                                reset_chunks.push((cx, cy));
+                            }
+                        }
+                    }
+                }
+
+                if restore_buildings {
+                    for g in self.guilds.values_mut() {
+                        for &bid in &g.demolished_buildings {
+                            restored_buildings.push(bid);
+                        }
+                        g.demolished_buildings.clear();
+                    }
+                }
+
+                let mut removed_vehs = 0usize;
+                if remove_vehicles {
+                    let before = self.vehicles.len();
+                    self.vehicles.retain(|_, v| {
+                        v.driver_uid.is_some()
+                            || !v.passengers.is_empty()
+                            || !in_radius(v.merc_x, v.merc_y)
+                    });
+                    removed_vehs = before.saturating_sub(self.vehicles.len());
+                }
+
+                let mut removed_bases = 0usize;
+                if remove_bases {
+                    for g in self.guilds.values_mut() {
+                        let before = g.bases.len();
+                        g.bases.retain(|b| !in_radius(b.door_merc_x, b.door_merc_y));
+                        removed_bases += before.saturating_sub(g.bases.len());
+                    }
+                }
+
+                self.dirty = true;
+                self.save_if_needed(true);
+                let summary = format!(
+                    "Bereich ({:.3}°, {:.3}°, {:.1} km) zurückgesetzt ({} Sektoren, {} Risse erneuert, {} Fahrzeuge & {} Basen entfernt).",
+                    lat,
+                    lon,
+                    r_km,
+                    reset_chunks.len(),
+                    unsealed_portals.len(),
+                    removed_vehs,
+                    removed_bases
+                );
+                self.log_event(format!("[Admin] {}", summary));
+                self.broadcast_all(&NetServerMsg::AdminWorldReset {
+                    new_world_seed: self.world_seed,
+                    full_world_wipe: false,
+                    reset_chunks,
+                    unsealed_portals,
+                    restored_buildings,
+                    message: summary.clone(),
+                });
+                self.publish_macro_sync();
+                summary
+            }
+            AdminCommand::ResetAllRiftsGlobal => {
+                let prev_sealed = self.sealed_portals.len() + self.stabilized_portals.len();
+                let all_unsealed: Vec<u64> = self
+                    .sealed_portals
+                    .iter()
+                    .chain(self.stabilized_portals.iter())
+                    .copied()
+                    .collect();
+                let reset_chunks: Vec<(i32, i32)> = self.chunk_rifts.keys().copied().collect();
+                self.sealed_portals.clear();
+                self.stabilized_portals.clear();
+                self.dungeons.clear();
+                self.chunk_rifts.clear();
+                self.overworld_rift_kills.clear();
+                self.dormant_overworld_portals.clear();
+                self.dirty = true;
+                self.save_if_needed(true);
+                let m = format!(
+                    "Alle Risse & Dungeons weltweit zurückgesetzt ({} versiegelte Portale wieder geöffnet).",
+                    prev_sealed
+                );
+                self.log_event(format!("[Admin] {}", m));
+                self.broadcast_all(&NetServerMsg::AdminWorldReset {
+                    new_world_seed: self.world_seed,
+                    full_world_wipe: true,
+                    reset_chunks,
+                    unsealed_portals: all_unsealed,
+                    restored_buildings: Vec::new(),
+                    message: m.clone(),
+                });
+                m
+            }
+            AdminCommand::RegenerateWorld {
+                new_seed,
+                keep_characters,
+            } => {
+                let _ = self.create_world_backup("pre_world_regen");
+                self.world_seed = new_seed.filter(|&s| s != 0).unwrap_or_else(|| rand::random::<u64>() | 1);
+                self.world_hour = 14.0;
+                self.sealed_portals.clear();
+                self.stabilized_portals.clear();
+                self.dungeons.clear();
+                self.chunk_rifts.clear();
+                self.overworld_rift_kills.clear();
+                self.dormant_overworld_portals.clear();
+                self.guilds.clear();
+                self.vehicles.clear();
+                self.next_guild_id = 1;
+                self.next_loot_id = 1;
+
+                if !keep_characters {
+                    self.characters.clear();
+                } else {
+                    for ch in self.characters.values_mut() {
+                        if let Ok(mut jv) =
+                            serde_json::from_slice::<serde_json::Value>(&ch.character_bincode)
+                        {
+                            if let Some(obj) = jv.as_object_mut() {
+                                obj.insert(
+                                    "world_seed".to_string(),
+                                    serde_json::json!(self.world_seed),
+                                );
+                                obj.remove("bases");
+                                obj.remove("guild");
+                            }
+                            if let Ok(new_bytes) = serde_json::to_vec(&jv) {
+                                ch.character_bincode = new_bytes;
+                            }
+                        }
+                    }
+                }
+
+                let online_uids: Vec<u64> = self.peers.keys().copied().collect();
+                for uid in online_uids {
+                    self.kick_peer_immediately(
+                        uid,
+                        "Die Serverwelt wurde vom Administrator neu generiert — bitte neu verbinden!",
+                        online_count,
+                    );
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                let m = format!(
+                    "Welt neu generiert (Neuer Seed: {}, Charaktere behalten: {}). Automatisches Backup wurde angelegt.",
+                    self.world_seed,
+                    if keep_characters { "Ja" } else { "Nein" }
+                );
+                self.log_event(format!("[Admin] {}", m));
+                m
+            }
+            AdminCommand::RepairAndRefuelVehicle { vehicle_id } => {
+                let Some(v) = self.vehicles.get_mut(&vehicle_id) else {
+                    return Err("Fahrzeug nicht gefunden.".to_string());
+                };
+                v.body_pct = 100.0;
+                v.tires_pct = 100.0;
+                v.battery_pct = 100.0;
+                v.fuel_liters = v.fuel_liters.max(65.0);
+                if let Ok(mut jv) = serde_json::from_slice::<serde_json::Value>(&v.vehicle_bincode)
+                {
+                    if let Some(obj) = jv.as_object_mut() {
+                        obj.insert("body_pct".to_string(), serde_json::json!(100.0));
+                        obj.insert("tires_pct".to_string(), serde_json::json!(100.0));
+                        obj.insert("battery_pct".to_string(), serde_json::json!(100.0));
+                        obj.insert("fuel_liters".to_string(), serde_json::json!(v.fuel_liters));
+                    }
+                    if let Ok(nb) = serde_json::to_vec(&jv) {
+                        v.vehicle_bincode = nb;
+                    }
+                }
+                let lbl = v.label_de.clone();
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                format!("Fahrzeug '{}' (#{}) vollgetankt & auf 100% repariert.", lbl, vehicle_id)
+            }
+            AdminCommand::UnlockVehicleSeats { vehicle_id } => {
+                let Some(v) = self.vehicles.get_mut(&vehicle_id) else {
+                    return Err("Fahrzeug nicht gefunden.".to_string());
+                };
+                v.driver_uid = None;
+                v.passengers.clear();
+                self.dirty = true;
+                self.publish_macro_sync();
+                format!("Sitze von Fahrzeug #{} freigegeben.", vehicle_id)
+            }
+            AdminCommand::DeleteVehicle { vehicle_id } => {
+                if self.vehicles.remove(&vehicle_id).is_none() {
+                    return Err("Fahrzeug nicht gefunden.".to_string());
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                format!("Fahrzeug #{} gelöscht.", vehicle_id)
+            }
+            AdminCommand::DeleteBase {
+                guild_id,
+                building_id,
+            } => {
+                let Some(g) = self.guilds.get_mut(&guild_id) else {
+                    return Err("Gilde nicht gefunden.".to_string());
+                };
+                let before = g.bases.len();
+                g.bases.retain(|b| b.building_id != building_id);
+                if g.bases.len() == before {
+                    return Err("Basis nicht gefunden.".to_string());
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                format!("Basis (Gebäude #{}) entfernt.", building_id)
+            }
+            AdminCommand::DisbandGuild { guild_id } => {
+                let Some(g) = self.guilds.remove(&guild_id) else {
+                    return Err("Gilde nicht gefunden.".to_string());
+                };
+                self.vehicles.retain(|_, v| v.guild_id != Some(guild_id));
+                for og in self.guilds.values_mut() {
+                    og.stances.remove(&guild_id);
+                }
+                for m in &g.members {
+                    if let Some(p) = self.peers.get_mut(&m.uid) {
+                        p.snap.guild_id = None;
+                        p.snap.guild_name.clear();
+                        p.snap.guild_role = PlayerGuildRole::Founder;
+                        let _ = p.tx.send(NetServerMsg::GuildRoleUpdated {
+                            guild_id: None,
+                            role: PlayerGuildRole::Founder,
+                            banner_msg: format!(
+                                "Die Gilde '{}' wurde vom Server-Administrator aufgelöst.",
+                                g.name
+                            ),
+                        });
+                    }
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                self.log_event(format!("[Admin] Gilde '{}' aufgelöst.", g.name));
+                format!("Gilde '{}' wurde aufgelöst.", g.name)
+            }
+            AdminCommand::ForceGlobalGuildPeace => {
+                for g in self.guilds.values_mut() {
+                    for st in g.stances.values_mut() {
+                        *st = PlayerGuildStance::Friendly;
+                    }
+                }
+                self.dirty = true;
+                self.save_if_needed(true);
+                self.publish_macro_sync();
+                self.broadcast_all(&NetServerMsg::ChatBroadcast {
+                    sender: "Admin".to_string(),
+                    text: "Alle Gilden-Konflikte wurden vom Administrator auf Friedlich gesetzt."
+                        .to_string(),
+                    is_system: true,
+                });
+                "Frieden zwischen allen Spieler-Gilden wiederhergestellt.".to_string()
+            }
+            AdminCommand::CreateBackup { label } => {
+                let fname = self.create_world_backup(&label)?;
+                self.log_event(format!("[Admin] Weltspeicher-Backup '{}' angelegt.", fname));
+                format!("Backup '{}' erfolgreich erstellt.", fname)
+            }
+            AdminCommand::RestoreBackup { filename } => {
+                if filename.contains('/') || filename.contains('\\') || filename.contains("..") || !filename.ends_with(".bin") {
+                    return Err("Ungültiger Backup-Dateiname.".to_string());
+                }
+                let bdir = self
+                    .backup_dir_path()
+                    .ok_or_else(|| "Kein Backup-Ordner verfügbar.".to_string())?;
+                let src = bdir.join(&filename);
+                if !src.exists() {
+                    return Err("Backup-Datei existiert nicht.".to_string());
+                }
+                let Some(ref dst_str) = self.config.world_save_path.clone() else {
+                    return Err("Kein Weltspeicherpfad konfiguriert.".to_string());
+                };
+                let online_uids: Vec<u64> = self.peers.keys().copied().collect();
+                for uid in online_uids {
+                    self.kick_peer_immediately(
+                        uid,
+                        "Serverwelt wird aus einem Admin-Backup wiederhergestellt — bitte gleich neu verbinden.",
+                        online_count,
+                    );
+                }
+                std::fs::copy(&src, dst_str)
+                    .map_err(|e| format!("Wiederherstellung fehlgeschlagen: {}", e))?;
+                self.characters.clear();
+                self.guilds.clear();
+                self.vehicles.clear();
+                self.sealed_portals.clear();
+                self.stabilized_portals.clear();
+                self.dungeons.clear();
+                self.chunk_rifts.clear();
+                self.overworld_rift_kills.clear();
+                self.dormant_overworld_portals.clear();
+                self.load_from_disk_if_present();
+                self.write_status_json();
+                self.log_event(format!("[Admin] Backup '{}' wiederhergestellt.", filename));
+                format!("Welt erfolgreich auf Backup '{}' zurückgesetzt!", filename)
+            }
+        };
+
+        Ok(admin::AdminActionReply {
+            ok: true,
+            message: msg,
+            state: self.build_admin_dashboard(),
+        })
+    }
 }
 
 enum HubEvent {
@@ -2300,11 +3655,14 @@ enum HubEvent {
     },
     DeleteCharacterQuery {
         req: NetClientMsg,
+        peer_ip: String,
         reply_tx: tokio::sync::oneshot::Sender<NetServerMsg>,
     },
     PeerConnected {
         hello: NetClientMsg,
+        peer_ip: String,
         tx: tokio::sync::mpsc::UnboundedSender<NetServerMsg>,
+        kick_tx: tokio::sync::oneshot::Sender<()>,
         accept_tx: tokio::sync::oneshot::Sender<bool>,
     },
     PeerPacket {
@@ -2314,13 +3672,44 @@ enum HubEvent {
     PeerDisconnected {
         uid: u64,
     },
+    AdminRequest {
+        cmd: admin::AdminCommand,
+        reply_tx: tokio::sync::oneshot::Sender<Result<admin::AdminActionReply, String>>,
+    },
     Shutdown,
 }
 
-/// Runs the authoritative DDNeo server loop on an active Tokio runtime until `stop_flag` is set
-/// or `shutdown_rx` resolves. Automatically flushes `server_world.bin` before returning.
+/// Runs the authoritative DDNeo server loop on an active Tokio runtime until `stop_flag` is set.
+/// If `config.admin_enabled` is true and no pre-bound `admin_listener` was supplied, binds the
+/// Admin Web Control Panel automatically on `config.admin_bind_ip:config.admin_port`.
 pub async fn run_server_on_listener(
     listener: tokio::net::TcpListener,
+    config: ServerConfig,
+    stop_flag: Arc<AtomicBool>,
+    online_count: Arc<AtomicUsize>,
+) {
+    let mut admin_listener_opt = None;
+    if config.admin_enabled {
+        let admin_bind = format!("{}:{}", config.admin_bind_ip, config.admin_port);
+        match tokio::net::TcpListener::bind(&admin_bind).await {
+            Ok(al) => {
+                admin_listener_opt = Some(al);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DDNeo-Server] Warnung: Admin-Webinterface konnte {} nicht binden: {}",
+                    admin_bind, e
+                );
+            }
+        }
+    }
+    run_server_with_admin_listener(listener, admin_listener_opt, config, stop_flag, online_count)
+        .await;
+}
+
+pub async fn run_server_with_admin_listener(
+    listener: tokio::net::TcpListener,
+    admin_listener: Option<tokio::net::TcpListener>,
     config: ServerConfig,
     stop_flag: Arc<AtomicBool>,
     online_count: Arc<AtomicUsize>,
@@ -2363,15 +3752,34 @@ pub async fn run_server_on_listener(
     let (hub_tx, mut hub_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
     let mut hub = ServerWorldHub::new(config.clone(), bound_port);
 
+    if let Some(adm_listener) = admin_listener {
+        let adm_tx = hub_tx.clone();
+        let adm_stop = Arc::clone(&stop_flag);
+        let auth = Arc::new(admin::AdminAuthStore::new(
+            config.admin_username.clone(),
+            config.admin_password.clone(),
+            config.session_name.clone(),
+        ));
+        let dispatch: admin::AdminDispatchFn = Arc::new(move |cmd| {
+            let (rtx, rrx) = tokio::sync::oneshot::channel();
+            let _ = adm_tx.send(HubEvent::AdminRequest { cmd, reply_tx: rtx });
+            rrx
+        });
+        tokio::spawn(async move {
+            admin::run_admin_http_server(adm_listener, auth, dispatch, adm_stop).await;
+        });
+    }
+
     let accept_hub_tx = hub_tx.clone();
     let accept_stop = Arc::clone(&stop_flag);
     tokio::spawn(async move {
         while !accept_stop.load(Ordering::Relaxed) {
-            let Ok(Ok((stream, _peer_addr))) =
+            let Ok(Ok((stream, peer_addr))) =
                 tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
             else {
                 continue;
             };
+            let peer_ip = peer_addr.ip().to_string();
             let _ = stream.set_nodelay(true);
             let h_tx = accept_hub_tx.clone();
             let p_stop = Arc::clone(&accept_stop);
@@ -2408,6 +3816,7 @@ pub async fn run_server_on_listener(
                     if h_tx
                         .send(HubEvent::DeleteCharacterQuery {
                             req: first_msg,
+                            peer_ip,
                             reply_tx: rep_tx,
                         })
                         .is_ok()
@@ -2424,11 +3833,14 @@ pub async fn run_server_on_listener(
                 };
                 let uid = *player_uid;
                 let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<NetServerMsg>();
+                let (kick_tx, mut kick_rx) = tokio::sync::oneshot::channel::<()>();
                 let (acc_tx, acc_rx) = tokio::sync::oneshot::channel::<bool>();
                 if h_tx
                     .send(HubEvent::PeerConnected {
                         hello: first_msg,
+                        peer_ip,
                         tx: out_tx,
+                        kick_tx,
                         accept_tx: acc_tx,
                     })
                     .is_err()
@@ -2450,17 +3862,28 @@ pub async fn run_server_on_listener(
                 });
 
                 if accepted {
+                    let mut kicked = false;
                     while !p_stop.load(Ordering::Relaxed) {
-                        match read_packet::<NetClientMsg>(&mut rd).await {
-                            Ok(pkt) => {
-                                if h_tx.send(HubEvent::PeerPacket { uid, msg: pkt }).is_err() {
-                                    break;
+                        tokio::select! {
+                            res = read_packet::<NetClientMsg>(&mut rd) => {
+                                match res {
+                                    Ok(pkt) => {
+                                        if h_tx.send(HubEvent::PeerPacket { uid, msg: pkt }).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
                                 }
                             }
-                            Err(_) => break,
+                            _ = &mut kick_rx => {
+                                kicked = true;
+                                break;
+                            }
                         }
                     }
-                    let _ = h_tx.send(HubEvent::PeerDisconnected { uid });
+                    if !kicked {
+                        let _ = h_tx.send(HubEvent::PeerDisconnected { uid });
+                    }
                 }
                 let _ = writer.await;
             });
@@ -2551,7 +3974,11 @@ fn process_hub_event(
                 existing_character,
             });
         }
-        HubEvent::DeleteCharacterQuery { req, reply_tx } => {
+        HubEvent::DeleteCharacterQuery {
+            req,
+            peer_ip,
+            reply_tx,
+        } => {
             if let NetClientMsg::DeleteServerCharacter {
                 protocol_version,
                 player_uid,
@@ -2570,6 +3997,14 @@ fn process_hub_event(
                             "Protokoll-Version inkompatibel (Server v{}, Client v{})",
                             PROTOCOL_VERSION, protocol_version
                         ),
+                    });
+                    return true;
+                }
+                if let Some(ban_msg) = hub.check_ban_reason(player_uid, &pubkey, &peer_ip) {
+                    let _ = reply_tx.send(NetServerMsg::CharacterDeleteReply {
+                        ok: false,
+                        deleted_name: String::new(),
+                        message: ban_msg,
                     });
                     return true;
                 }
@@ -2616,6 +4051,10 @@ fn process_hub_event(
                 hub.purge_character_for_reset(player_uid);
                 hub.save_if_needed(true);
                 hub.publish_macro_sync();
+                hub.log_event(format!(
+                    "Charakter '{}' (UID {}) per Spielersignatur gelöscht.",
+                    deleted_name, player_uid
+                ));
                 if hub.config.is_dedicated {
                     println!(
                         "[DDNeo-Server] Charakter '{}' (UID {}) per Ed25519-Signatur gelöscht.",
@@ -2634,7 +4073,9 @@ fn process_hub_event(
         }
         HubEvent::PeerConnected {
             hello,
+            peer_ip,
             tx,
+            kick_tx,
             accept_tx,
         } => {
             if let NetClientMsg::Hello {
@@ -2660,6 +4101,15 @@ fn process_hub_event(
                             PROTOCOL_VERSION, protocol_version
                         ),
                     });
+                    let _ = accept_tx.send(false);
+                    return true;
+                }
+                if let Some(ban_msg) = hub.check_ban_reason(player_uid, &pubkey, &peer_ip) {
+                    hub.log_event(format!(
+                        "[Sperre] Verbindungsversuch von UID {} ({}) abgelehnt.",
+                        player_uid, peer_ip
+                    ));
+                    let _ = tx.send(NetServerMsg::Rejected { reason: ban_msg });
                     let _ = accept_tx.send(false);
                     return true;
                 }
@@ -2694,6 +4144,15 @@ fn process_hub_event(
                     let _ = accept_tx.send(false);
                     return true;
                 }
+
+                hub.player_meta.insert(
+                    player_uid,
+                    admin::PlayerAdminMeta {
+                        last_ip: peer_ip.clone(),
+                        last_seen_unix_secs: current_unix_ms() / 1000,
+                        device_fingerprint: format_pubkey_fingerprint(&pubkey),
+                    },
+                );
 
                 let existing_guild = if reset_character {
                     None
@@ -2765,6 +4224,8 @@ fn process_hub_event(
                     max_players: hub.config.max_players,
                     world_seed: hub.world_seed,
                     world_hour: hub.world_hour,
+                    world_tier: hub.world_tier,
+                    world_level_offset: hub.world_level_offset,
                     is_dedicated: hub.config.is_dedicated,
                     assigned_guild_id: gid,
                     assigned_guild_role: grole,
@@ -2786,15 +4247,21 @@ fn process_hub_event(
                     ConnectedPeer {
                         uid: player_uid,
                         tx,
+                        kick_tx: Some(kick_tx),
                         snap,
                         awaiting_creation,
                         reset_on_creation: reset_character,
+                        peer_ip,
                     },
                 );
                 online_count.store(hub.peers.len(), Ordering::Relaxed);
                 let _ = accept_tx.send(true);
 
                 if !awaiting_creation {
+                    hub.log_event(format!(
+                        "Spieler '{}' (UID {}) beigetreten.",
+                        eff_name, player_uid
+                    ));
                     if hub.config.is_dedicated {
                         println!(
                             "[DDNeo-Server] Spieler verbunden: '{}' (UID {}, {}/{} online)",
@@ -2818,8 +4285,15 @@ fn process_hub_event(
             hub.handle_msg(uid, msg);
         }
         HubEvent::PeerDisconnected { uid } => {
+            if let Some(m) = hub.player_meta.get_mut(&uid) {
+                m.last_seen_unix_secs = current_unix_ms() / 1000;
+            }
             hub.handle_disconnect(uid);
             online_count.store(hub.peers.len(), Ordering::Relaxed);
+        }
+        HubEvent::AdminRequest { cmd, reply_tx } => {
+            let res = hub.execute_admin_command(cmd, online_count);
+            let _ = reply_tx.send(res);
         }
     }
     true
@@ -2830,6 +4304,7 @@ fn process_hub_event(
 // =====================================================================
 pub struct RunningServerHandle {
     pub bound_addr: SocketAddr,
+    pub admin_bound_addr: Option<SocketAddr>,
     pub max_players: u8,
     pub session_name: String,
     stop_flag: Arc<AtomicBool>,
@@ -2841,7 +4316,8 @@ impl RunningServerHandle {
     pub fn start(config: ServerConfig) -> Result<Self, String> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let online_count = Arc::new(AtomicUsize::new(0));
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
+        let (addr_tx, addr_rx) =
+            std::sync::mpsc::channel::<Result<(SocketAddr, Option<SocketAddr>), String>>();
 
         let stop_clone = Arc::clone(&stop_flag);
         let count_clone = Arc::clone(&online_count);
@@ -2881,18 +4357,38 @@ impl RunningServerHandle {
                             return;
                         }
                     };
-                    let _ = addr_tx.send(Ok(local_addr));
-                    run_server_on_listener(listener, cfg_clone, stop_clone, count_clone).await;
+
+                    let mut admin_listener_opt = None;
+                    let mut admin_addr_opt = None;
+                    if cfg_clone.admin_enabled {
+                        let adm_str =
+                            format!("{}:{}", cfg_clone.admin_bind_ip, cfg_clone.admin_port);
+                        if let Ok(al) = tokio::net::TcpListener::bind(&adm_str).await {
+                            admin_addr_opt = al.local_addr().ok();
+                            admin_listener_opt = Some(al);
+                        }
+                    }
+
+                    let _ = addr_tx.send(Ok((local_addr, admin_addr_opt)));
+                    run_server_with_admin_listener(
+                        listener,
+                        admin_listener_opt,
+                        cfg_clone,
+                        stop_clone,
+                        count_clone,
+                    )
+                    .await;
                 });
             })
             .map_err(|e| e.to_string())?;
 
-        let bound_addr = addr_rx
+        let (bound_addr, admin_bound_addr) = addr_rx
             .recv_timeout(Duration::from_secs(4))
             .map_err(|_| "Timeout beim Starten des Servers".to_string())??;
 
         Ok(Self {
             bound_addr,
+            admin_bound_addr,
             max_players: config.max_players,
             session_name: config.session_name,
             stop_flag,
@@ -2944,6 +4440,7 @@ mod tests {
             world_save_path: Some(world_file.to_string_lossy().to_string()),
             status_json_path: Some(status_file.to_string_lossy().to_string()),
             ingame_day_real_secs: 1440.0,
+            ..Default::default()
         };
 
         let owner_seed = [0x42u8; 32];
@@ -3259,6 +4756,296 @@ mod tests {
             srv2.shutdown();
         }
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_admin_web_panel_login_device_ban_world_tier_area_reset_and_backups() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ddneo_adm_test_{}", rand::random::<u32>()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let world_file = tmp_dir.join("server_world.bin");
+        let status_file = tmp_dir.join("server_status.json");
+
+        let cfg = ServerConfig {
+            bind_ip: "127.0.0.1".to_string(),
+            tcp_port: 0,
+            session_name: "AdminWebTest".to_string(),
+            world_save_path: Some(world_file.to_string_lossy().to_string()),
+            status_json_path: Some(status_file.to_string_lossy().to_string()),
+            admin_enabled: true,
+            admin_bind_ip: "127.0.0.1".to_string(),
+            admin_port: 0,
+            admin_username: "burns_admin".to_string(),
+            admin_password: "SuperSecretConfigPass!".to_string(),
+            ..Default::default()
+        };
+
+        let mut srv = RunningServerHandle::start(cfg).expect("Start server with admin HTTP");
+        let game_addr = srv.bound_addr;
+        let adm_addr = srv.admin_bound_addr.expect("Admin HTTP port must bind");
+
+        async fn raw_http(
+            addr: SocketAddr,
+            method: &str,
+            path: &str,
+            cookie: Option<&str>,
+            csrf: Option<&str>,
+            body: Option<&str>,
+        ) -> (u16, String, String) {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let b = body.unwrap_or("");
+            let mut req = format!(
+                "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n",
+                method,
+                path,
+                b.len()
+            );
+            if body.is_some() {
+                req.push_str("Content-Type: application/json\r\n");
+            }
+            if let Some(c) = cookie {
+                req.push_str(&format!("Cookie: ddneo_admin_session={}\r\n", c));
+            }
+            if let Some(t) = csrf {
+                req.push_str(&format!("X-CSRF-Token: {}\r\n", t));
+            }
+            req.push_str("\r\n");
+            req.push_str(b);
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.unwrap();
+            let txt = String::from_utf8_lossy(&resp).to_string();
+            let (hdrs, body_out) = txt.split_once("\r\n\r\n").unwrap_or((&txt, ""));
+            let code = hdrs
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(500);
+            let mut set_cookie_tok = String::new();
+            for line in hdrs.lines() {
+                if line.to_ascii_lowercase().starts_with("set-cookie:") {
+                    if let Some(rest) = line.split("ddneo_admin_session=").nth(1) {
+                        set_cookie_tok = rest.split(';').next().unwrap_or("").to_string();
+                    }
+                }
+            }
+            (code, set_cookie_tok, body_out.to_string())
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 1. Unauthenticated dashboard request MUST return 401
+            let (code, _, _) = raw_http(adm_addr, "GET", "/api/dashboard", None, None, None).await;
+            assert_eq!(code, 401);
+
+            // 2. Wrong password MUST return 401
+            let (code_bad, _, _) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/login",
+                None,
+                None,
+                Some(r#"{"username":"burns_admin","password":"wrong"}"#),
+            )
+            .await;
+            assert_eq!(code_bad, 401);
+
+            // 3. Correct config credentials succeed & issue session cookie + CSRF token
+            let (code_ok, sess_cookie, login_json) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/login",
+                None,
+                None,
+                Some(r#"{"username":"burns_admin","password":"SuperSecretConfigPass!"}"#),
+            )
+            .await;
+            assert_eq!(code_ok, 200);
+            assert!(!sess_cookie.is_empty());
+            let lj: serde_json::Value = serde_json::from_str(&login_json).unwrap();
+            let csrf = lj["csrf_token"].as_str().unwrap().to_string();
+
+            // 4. Connect a player ('Griefer', UID 777) with hardware-anchored Ed25519 key
+            let griefer_seed = [0x77u8; 32];
+            let ts = current_unix_ms();
+            let (g_pk, g_r, g_s) = sign_auth_action(&griefer_seed, AUTH_ACTION_HELLO, 777, ts);
+            let g_fp = format_pubkey_fingerprint(&g_pk);
+
+            let stream = tokio::net::TcpStream::connect(game_addr).await.unwrap();
+            let (mut rd, mut wr) = stream.into_split();
+            write_packet(
+                &mut wr,
+                &NetClientMsg::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    player_uid: 777,
+                    name: "Griefer".to_string(),
+                    password: String::new(),
+                    level: 1,
+                    role_id: 0,
+                    appearance_bytes: [1u8; 24],
+                    net_pos: NetWorldPos::Overworld {
+                        merc_x: 1_492_000.0,
+                        merc_y: 6_894_000.0,
+                    },
+                    reset_character: false,
+                    pubkey: g_pk,
+                    auth_timestamp_ms: ts,
+                    sig_r: g_r,
+                    sig_s: g_s,
+                },
+            )
+            .await
+            .unwrap();
+            let _welcome = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
+
+            // Report a base-level 6 rift in chunk (994, 4596)
+            write_packet(
+                &mut wr,
+                &NetClientMsg::ReportChunkRifts {
+                    chunk_x: 994,
+                    chunk_y: 4596,
+                    from_real_osm: true,
+                    rifts: vec![WireOverworldRift {
+                        id: 12345,
+                        merc_x: 1_492_000.0,
+                        merc_y: 6_894_000.0,
+                        theme: "Feuer".to_string(),
+                        color_rgba: [1.0, 0.2, 0.2, 1.0],
+                        base_level: 6,
+                        level: 6,
+                        max_floors: 3,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            // 5. Raise World Tier to 4 (+9 levels -> rift 12345 becomes level 15!) and lower to 0 (halved -> level 3!)
+            let (c_tier, _, tier_body) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/action",
+                Some(&sess_cookie),
+                Some(&csrf),
+                Some(r#"{"type":"SetWorldDifficulty","world_tier":4,"world_level_offset":0}"#),
+            )
+            .await;
+            assert_eq!(c_tier, 200);
+            let tj: serde_json::Value = serde_json::from_str(&tier_body).unwrap();
+            assert_eq!(tj["state"]["world_tier"], 4);
+            assert_eq!(tj["state"]["rifts_preview"][0]["level"], 15);
+
+            // 6. Create backup before banning & resetting
+            let (c_bk, _, bk_body) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/action",
+                Some(&sess_cookie),
+                Some(&csrf),
+                Some(r#"{"type":"CreateBackup","label":"autotest"}"#),
+            )
+            .await;
+            assert_eq!(c_bk, 200);
+            let bkj: serde_json::Value = serde_json::from_str(&bk_body).unwrap();
+            assert_eq!(bkj["state"]["backups"].as_array().unwrap().len(), 1);
+
+            // 7. Ban Griefer by Device-ID! Verify live session is immediately kicked AND reconnect even with NEW UID/Name is blocked by Device-ID!
+            let ban_req = serde_json::json!({
+                "type": "BanDevice",
+                "player_uid": 777,
+                "pubkey_hex": "",
+                "device_fingerprint": "",
+                "ip_address": null,
+                "player_name": "Griefer",
+                "reason": "Griefing im Test",
+                "delete_character": false
+            })
+            .to_string();
+            let (c_ban, _, _) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/action",
+                Some(&sess_cookie),
+                Some(&csrf),
+                Some(&ban_req),
+            )
+            .await;
+            assert_eq!(c_ban, 200);
+
+            // Attempt reconnect with SAME hardware Ed25519 key (`griefer_seed`), even pretending a different name/UID -> MUST BE REJECTED!
+            let stream2 = tokio::net::TcpStream::connect(game_addr).await.unwrap();
+            let (mut rd2, mut wr2) = stream2.into_split();
+            let ts2 = current_unix_ms();
+            let (g_pk2, g_r2, g_s2) = sign_auth_action(&griefer_seed, AUTH_ACTION_HELLO, 888, ts2);
+            write_packet(
+                &mut wr2,
+                &NetClientMsg::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    player_uid: 888,
+                    name: "NeuerNameGleichesGeraet".to_string(),
+                    password: String::new(),
+                    level: 1,
+                    role_id: 0,
+                    appearance_bytes: [1u8; 24],
+                    net_pos: NetWorldPos::default(),
+                    reset_character: false,
+                    pubkey: g_pk2,
+                    auth_timestamp_ms: ts2,
+                    sig_r: g_r2,
+                    sig_s: g_s2,
+                },
+            )
+            .await
+            .unwrap();
+            let rej = read_packet::<NetServerMsg>(&mut rd2).await.unwrap();
+            match rej {
+                NetServerMsg::Rejected { reason } => {
+                    assert!(
+                        reason.contains(&g_fp) && reason.contains("Griefing im Test"),
+                        "Expected Device-ID ban rejection, got: {}",
+                        reason
+                    );
+                }
+                other => panic!("Expected Rejected for banned Device-ID, got {:?}", other),
+            }
+
+            // 8. Reset Area & Regenerate World via Admin API
+            let (c_ar, _, _) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/action",
+                Some(&sess_cookie),
+                Some(&csrf),
+                Some(r#"{"type":"ResetArea","lat":52.52,"lon":13.40,"radius_km":3.0,"reset_rifts":true,"restore_buildings":true,"remove_vehicles":false,"remove_bases":false}"#),
+            )
+            .await;
+            assert_eq!(c_ar, 200);
+
+            let (c_reg, _, reg_body) = raw_http(
+                adm_addr,
+                "POST",
+                "/api/action",
+                Some(&sess_cookie),
+                Some(&csrf),
+                Some(r#"{"type":"RegenerateWorld","new_seed":987654321,"keep_characters":false}"#),
+            )
+            .await;
+            assert_eq!(c_reg, 200);
+            let rj: serde_json::Value = serde_json::from_str(&reg_body).unwrap();
+            assert_eq!(rj["state"]["world_seed"], 987654321);
+            // Device-ID ban list MUST survive world regeneration!
+            assert_eq!(rj["state"]["bans"].as_array().unwrap().len(), 1);
+        });
+
+        srv.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

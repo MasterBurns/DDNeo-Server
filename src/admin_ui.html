@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DDNeo Dedicated Server — Admin-Kontrollzentrum</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+<style>
+  :root {
+    --bg-deep: #0c1015;
+    --bg-panel: #141a22;
+    --bg-card: #1a222d;
+    --bg-input: #0f141b;
+    --border: #2c394b;
+    --brass: #d8b168;
+    --brass-dim: #9d7e46;
+    --emerald: #3ad29f;
+    --cyan: #5ed3f3;
+    --danger: #ef6461;
+    --warn: #f0a854;
+    --text: #e7edf5;
+    --muted: #8fa0b5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg-deep); color: var(--text); font-size: 14px; line-height: 1.45;
+  }
+  button, input, select {
+    font-family: inherit; font-size: 13px; border-radius: 5px;
+  }
+  input, select {
+    background: var(--bg-input); color: var(--text); border: 1px solid var(--border);
+    padding: 7px 10px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--brass); }
+  button {
+    background: #222d3b; color: var(--text); border: 1px solid var(--border);
+    padding: 7px 12px; cursor: pointer; font-weight: 600; transition: 0.12s;
+  }
+  button:hover { border-color: var(--brass); background: #2a3849; }
+  button.primary { background: #1c3f36; border-color: var(--emerald); color: #b9fbe2; }
+  button.primary:hover { background: #245246; }
+  button.brass { background: #3b301c; border-color: var(--brass); color: #ffe5b0; }
+  button.brass:hover { background: #4d3e24; }
+  button.danger { background: #3d1d21; border-color: var(--danger); color: #ffc2c0; }
+  button.danger:hover { background: #52252b; }
+  button.sm { padding: 4px 8px; font-size: 12px; }
+
+  #login-wrap {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .login-card {
+    width: 100%; max-width: 410px; background: var(--bg-panel);
+    border: 1px solid var(--brass-dim); border-radius: 8px; padding: 26px;
+    box-shadow: 0 18px 48px rgba(0,0,0,0.55);
+  }
+  .login-card h1 { margin: 0 0 4px 0; font-size: 21px; color: var(--brass); }
+  .login-card p { margin: 0 0 18px 0; color: var(--muted); font-size: 13px; }
+  .form-row { margin-bottom: 12px; display: flex; flex-direction: column; gap: 5px; }
+  .form-row label { font-size: 12px; color: var(--muted); font-weight: 600; }
+
+  header.topbar {
+    background: var(--bg-panel); border-bottom: 1px solid var(--brass-dim);
+    padding: 11px 20px; display: flex; flex-wrap: wrap; gap: 14px;
+    align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 500;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .brand h2 { margin: 0; font-size: 17px; color: var(--brass); letter-spacing: 0.4px; }
+  .pill {
+    padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    background: var(--bg-card); border: 1px solid var(--border); color: var(--text);
+  }
+  .pill.ok { border-color: var(--emerald); color: var(--emerald); }
+  .pill.warn { border-color: var(--warn); color: var(--warn); }
+  .pill.cyan { border-color: var(--cyan); color: var(--cyan); }
+
+  nav.tabs {
+    display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 20px;
+    background: #10161d; border-bottom: 1px solid var(--border);
+  }
+  nav.tabs button { background: transparent; border-color: transparent; color: var(--muted); }
+  nav.tabs button.active {
+    background: var(--bg-card); border-color: var(--brass); color: var(--brass);
+  }
+
+  main { max-width: 1480px; margin: 0 auto; padding: 18px 20px 50px; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(410px, 1fr)); gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--bg-panel); border: 1px solid var(--border);
+    border-radius: 7px; padding: 15px 16px; margin-bottom: 16px;
+  }
+  .card h3 { margin: 0 0 10px 0; font-size: 15px; color: var(--brass); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid #222c3a; vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .actions { display: flex; flex-wrap: wrap; gap: 5px; }
+
+  #admin-map { width: 100%; height: 470px; border-radius: 6px; border: 1px solid var(--border); background: #0d131a; }
+  .log-box {
+    max-height: 300px; overflow-y: auto; background: var(--bg-input);
+    border: 1px solid var(--border); border-radius: 5px; padding: 8px 10px;
+    font-family: ui-monospace, monospace; font-size: 12px;
+  }
+  .log-line { padding: 3px 0; border-bottom: 1px dashed #1c2531; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; padding: 11px 16px; border-radius: 6px;
+    background: #172a24; border: 1px solid var(--emerald); color: #d4fff0;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.6); z-index: 9999; display: none; max-width: 480px;
+  }
+  .toast.err { background: #38191d; border-color: var(--danger); color: #ffd4d2; }
+  .hidden { display: none !important; }
+  .inline-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .stat-big { font-size: 22px; font-weight: 700; color: var(--cyan); }
+</style>
+</head>
+<body>
+
+<div id="login-wrap" class="hidden">
+  <form class="login-card" onsubmit="doLogin(event)">
+    <h1>DDNeo Server-Verwaltung</h1>
+    <p id="login-server-title">Bitte mit den Zugangsdaten aus <code>server_config.json</code> anmelden.</p>
+    <div class="form-row">
+      <label>Benutzername (<code>admin_username</code>)</label>
+      <input id="login-user" type="text" autocomplete="username" value="admin" required>
+    </div>
+    <div class="form-row">
+      <label>Passwort (<code>admin_password</code>)</label>
+      <input id="login-pass" type="password" autocomplete="current-password" required>
+    </div>
+    <div id="login-err" style="color:var(--danger);font-size:12.5px;margin-bottom:10px;"></div>
+    <button type="submit" class="brass" style="width:100%;padding:9px;">Anmelden</button>
+  </form>
+</div>
+
+<div id="app-wrap" class="hidden">
+  <header class="topbar">
+    <div class="brand">
+      <h2 id="hdr-name">DDNeo Server</h2>
+      <span id="hdr-hib" class="pill ok">Aktiv</span>
+      <span id="hdr-players" class="pill cyan">0 / 12 Spieler</span>
+      <span id="hdr-tier" class="pill">Weltstufe 1</span>
+      <span id="hdr-hour" class="pill">14:00 Uhr</span>
+      <span id="hdr-seed" class="pill mono">Seed: -</span>
+      <span id="hdr-uptime" class="pill muted">Laufzeit: 0m</span>
+    </div>
+    <div class="inline-group">
+      <label class="muted" style="display:flex;align-items:center;gap:5px;cursor:pointer;">
+        <input type="checkbox" id="auto-refresh" checked> Live-Update (3s)
+      </label>
+      <button class="sm primary" onclick="sendAction({type:'ForceSave'})">💾 Sofort speichern</button>
+      <button class="sm" onclick="refreshDashboard()">🔄 Aktualisieren</button>
+      <button class="sm danger" onclick="doLogout()">Abmelden</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="overview" class="active" onclick="switchTab('overview')">📊 Übersicht & Weltstufe</button>
+    <button data-tab="players" onclick="switchTab('players')">👤 Charaktere & Spieler (<span id="cnt-chars">0</span>)</button>
+    <button data-tab="map" onclick="switchTab('map')">🗺 Weltkarte & Bereiche zurücksetzen</button>
+    <button data-tab="bans" onclick="switchTab('bans')">🚫 Device-ID Bannliste (<span id="cnt-bans">0</span>)</button>
+    <button data-tab="world_entities" onclick="switchTab('world_entities')">🏰 Gilden, Basen & 🚗 Fahrzeuge</button>
+    <button data-tab="maintenance" onclick="switchTab('maintenance')">🔄 Welt neu generieren & 💾 Backups</button>
+  </nav>
+
+  <main>
+    <!-- TAB 1: OVERVIEW & WORLD DIFFICULTY -->
+    <section id="tab-overview">
+      <div class="grid-2">
+        <div class="card">
+          <h3>⚔ Weltstufe & Schwierigkeitsgrad (Live)</h3>
+          <p class="muted" style="margin-top:0;">
+            Passt Riss-, Wächter- und Dungeon-Stufen auf dem gesamten Server sofort für alle Spieler an.
+            <strong>Weltstufe 0</strong> halbiert Stufen für Einsteiger; <strong>Weltstufe 1</strong> ist Standard; jede weitere Stufe addiert <strong>+3 Gegnerstufen</strong>.
+          </p>
+          <div class="inline-group" style="margin: 12px 0;">
+            <button onclick="stepWorldTier(-1)">− Weltstufe senken</button>
+            <div style="padding:6px 14px;background:var(--bg-input);border:1px solid var(--brass-dim);border-radius:5px;">
+              Aktuell: <strong id="ov-tier-lbl" style="color:var(--brass);font-size:16px;">Weltstufe 1</strong>
+            </div>
+            <button class="brass" onclick="stepWorldTier(1)">+ Weltstufe erhöhen</button>
+          </div>
+          <div class="inline-group" style="margin-bottom:10px;">
+            <label class="muted">Direkt setzen — Weltstufe (0–50):</label>
+            <input id="inp-world-tier" type="number" min="0" max="50" value="1" style="width:78px;">
+            <label class="muted">Fein-Offset (−20 bis +200 Stufen):</label>
+            <input id="inp-level-offset" type="number" min="-20" max="200" value="0" style="width:82px;">
+            <button class="primary" onclick="applyWorldDifficulty()">Übernehmen</button>
+          </div>
+          <div id="ov-rift-preview" class="muted">Resultierende Riss-Stufen weltweit: Stufe 2 – 14</div>
+        </div>
+
+        <div class="card">
+          <h3>🕒 Weltzeit & Globale Server-Durchsage</h3>
+          <div class="inline-group" style="margin-bottom:12px;">
+            <button class="sm" onclick="setWorldHour(7.5)">🌅 07:30 Morgen</button>
+            <button class="sm" onclick="setWorldHour(13.0)">☀ 13:00 Mittag</button>
+            <button class="sm" onclick="setWorldHour(19.5)">🌇 19:30 Dämmerung</button>
+            <button class="sm" onclick="setWorldHour(0.5)">🌙 00:30 Nacht</button>
+            <input id="inp-world-hour" type="number" min="0" max="23.9" step="0.5" value="14.0" style="width:74px;">
+            <button class="sm primary" onclick="setWorldHour(parseFloat(document.getElementById('inp-world-hour').value))">Uhrzeit setzen</button>
+          </div>
+          <div class="inline-group" style="margin-bottom:14px;">
+            <label class="muted">Echtzeit-Dauer pro Ingame-Tag (Sek.):</label>
+            <input id="inp-day-secs" type="number" min="60" max="86400" step="60" value="1440" style="width:95px;">
+            <button class="sm" onclick="applyDayLength()">Tagestempo speichern</button>
+          </div>
+          <hr style="border:0;border-top:1px solid var(--border);margin:12px 0;">
+          <label class="muted" style="display:block;margin-bottom:5px;">📢 System-Nachricht an alle eingeloggten Spieler (Tablet-Chat & Banner):</label>
+          <div class="inline-group">
+            <input id="inp-broadcast" type="text" placeholder="z.B. Kurze Server-Wartung in 5 Minuten…" style="flex:1;min-width:220px;" onkeydown="if(event.key==='Enter')sendBroadcast()">
+            <button class="brass" onclick="sendBroadcast()">Durchsage senden</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>⚙ Server-Konfiguration (Live & <code>server_config.json</code>)</h3>
+          <div class="grid-2" style="grid-template-columns: 1fr 1fr; gap:10px;">
+            <div class="form-row">
+              <label>Angezeigter Servername</label>
+              <input id="cfg-session-name" type="text">
+            </div>
+            <div class="form-row">
+              <label>Max. Spieler (2–64)</label>
+              <input id="cfg-max-players" type="number" min="2" max="64">
+            </div>
+            <div class="form-row">
+              <label>Beitritts-Passwort (leer = öffentlich)</label>
+              <input id="cfg-password" type="text" placeholder="Kein Passwort gesetzt">
+            </div>
+            <div class="form-row" style="justify-content:flex-end;">
+              <label style="display:flex;align-items:center;gap:7px;cursor:pointer;color:var(--text);">
+                <input id="cfg-pause-empty" type="checkbox"> 0%-CPU Ruhemodus bei 0 Spielern
+              </label>
+            </div>
+          </div>
+          <div class="inline-group" style="margin-top:8px;">
+            <button class="primary" onclick="saveServerSettings()">Einstellungen live anwenden & in Config speichern</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>📜 Live Server- & Chat-Protokoll (letzte Ereignisse)</h3>
+          <div id="event-log" class="log-box"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: PLAYERS & CHARACTERS -->
+    <section id="tab-players" class="hidden">
+      <div class="card">
+        <h3>
+          <span>👤 Alle registrierten Charaktere & Verbundenen Spieler</span>
+          <input id="char-filter" type="text" placeholder="🔍 Name, Device-ID, Gilde oder IP filtern…" oninput="renderPlayersTable()" style="width:290px;">
+        </h3>
+        <p class="muted" style="margin-top:0;">
+          Jeder Spieler besitzt eine kryptografische <strong>Ed25519 Device-ID</strong> (verankert an Hardware/System). Sperrst du eine Device-ID, kann dieses Gerät auch mit neuem Charakternamen nicht mehr beitreten.
+        </p>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Charakter</th>
+                <th>Gilde</th>
+                <th>Dimension & Standort</th>
+                <th>Device-ID (Ed25519) & UID</th>
+                <th>Letzte IP / Gesehen</th>
+                <th>Admin- & Troubleshooting-Aktionen</th>
+              </tr>
+            </thead>
+            <tbody id="players-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: LIVE MAP & AREA RESET -->
+    <section id="tab-map" class="hidden">
+      <div class="grid-2" style="grid-template-columns: 1.55fr 1fr;">
+        <div class="card">
+          <h3>
+            <span>🗺 Live OpenStreetMap Weltübersicht (Klick wählt Zielpunkt)</span>
+            <button class="sm" onclick="fitMapToMarkers()">Alle Marker zeigen</button>
+          </h3>
+          <div id="admin-map"></div>
+          <p class="muted" style="margin:8px 0 0 0;">
+            🟢 Online-Spieler &nbsp;•&nbsp; ⚪ Offline-Charaktere &nbsp;•&nbsp; 🏰 Gilden-Basen &nbsp;•&nbsp; 🚗 Fahrzeuge &nbsp;•&nbsp; 🟣 Aktive Risse.
+            Klicke auf einen beliebigen Ort auf der Karte, um die GPS-Koordinaten rechts für <strong>Bereich zurücksetzen</strong> oder <strong>Teleport</strong> zu übernehmen.
+          </p>
+        </div>
+
+        <div>
+          <div class="card">
+            <h3>🔄 Bereich im Umkreis zurücksetzen (Area / Chunk Reset)</h3>
+            <div class="form-row">
+              <label>Schnellauswahl: Zentrum auf Spieler-Standort setzen</label>
+              <select id="area-player-select" onchange="pickPlayerForCoords(this.value)">
+                <option value="">— Spieler oder Karte anklicken —</option>
+              </select>
+            </div>
+            <div class="grid-2" style="grid-template-columns: 1fr 1fr; gap:8px;">
+              <div class="form-row">
+                <label>Breitengrad (Lat)</label>
+                <input id="area-lat" type="number" step="0.0001" value="52.5200">
+              </div>
+              <div class="form-row">
+                <label>Längengrad (Lon)</label>
+                <input id="area-lon" type="number" step="0.0001" value="13.4050">
+              </div>
+            </div>
+            <div class="form-row">
+              <label>Radius um diesen Punkt (km)</label>
+              <select id="area-radius">
+                <option value="1.0">1.0 km (Lokales Dorf / Nachbarschaft)</option>
+                <option value="2.5" selected>2.5 km (Kleinstadt / ~3×3 Sektoren)</option>
+                <option value="5.0">5.0 km (Stadtgebiet)</option>
+                <option value="10.0">10.0 km (Großer Cluster)</option>
+                <option value="25.0">25.0 km (Gesamte Region)</option>
+              </select>
+            </div>
+            <div class="form-row" style="gap:7px;margin:10px 0;">
+              <label style="color:var(--text);"><input type="checkbox" id="ar-rifts" checked> Risse, versiegelte Portale & Dungeon-Etagen im Bereich neu öffnen</label>
+              <label style="color:var(--text);"><input type="checkbox" id="ar-bldgs" checked> Abgerissene OSM-Gebäude wiederherstellen</label>
+              <label style="color:var(--text);"><input type="checkbox" id="ar-vehs"> Ungenutzte Fahrzeuge im Bereich entfernen</label>
+              <label style="color:var(--danger);"><input type="checkbox" id="ar-bases"> ⚠ Auch Spieler-Basen im Bereich löschen (Notfall)</label>
+            </div>
+            <button class="brass" style="width:100%;" onclick="triggerAreaReset()">🔄 Ausgewählten Bereich jetzt zurücksetzen</button>
+          </div>
+
+          <div class="card">
+            <h3>⚡ Spieler zu diesem Kartenpunkt teleportieren</h3>
+            <div class="form-row">
+              <label>Ziel-Spieler (funktioniert live im Spiel & offline!)</label>
+              <select id="tp-player-select">
+                <option value="">— Spieler wählen —</option>
+              </select>
+            </div>
+            <button class="primary" style="width:100%;" onclick="teleportSelectedPlayerToAreaCoords()">⚡ Spieler zu obigen GPS-Koordinaten teleportieren</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: DEVICE-ID BANS -->
+    <section id="tab-bans" class="hidden">
+      <div class="card">
+        <h3>🚫 Manuelle Sperre hinzufügen (Device-ID / Public-Key / UID / IP)</h3>
+        <div class="grid-3">
+          <div class="form-row">
+            <label>Device-ID (<code>ED25519-...</code> oder 64-Hex Public-Key)</label>
+            <input id="ban-device" type="text" placeholder="ED25519-XXXX-XXXX-XXXX">
+          </div>
+          <div class="form-row">
+            <label>Optionale Spieler-UID / IP-Adresse</label>
+            <div class="inline-group">
+              <input id="ban-uid" type="number" placeholder="UID (opt.)" style="width:48%;">
+              <input id="ban-ip" type="text" placeholder="IP (opt.)" style="width:48%;">
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Notizname & Sperrgrund</label>
+            <div class="inline-group">
+              <input id="ban-name" type="text" placeholder="Spielername" style="width:38%;">
+              <input id="ban-reason" type="text" placeholder="Grund (z.B. Griefing)" style="width:58%;">
+            </div>
+          </div>
+        </div>
+        <button class="danger" onclick="submitManualBan()">🚫 Sperre eintragen & aktive Sitzung sofort trennen</button>
+      </div>
+
+      <div class="card">
+        <h3>🔒 Aktive Gerätesperren (<code>server_world.bin.bans.json</code>)</h3>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Spielername</th>
+                <th>Device-ID (Fingerprint & Public-Key)</th>
+                <th>UID / IP</th>
+                <th>Grund</th>
+                <th>Gesperrt am</th>
+                <th>Aktion</th>
+              </tr>
+            </thead>
+            <tbody id="bans-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: GUILDS, BASES & VEHICLES -->
+    <section id="tab-world-entities" class="hidden">
+      <div class="card">
+        <h3>
+          <span>🏰 Spieler-Gilden & Beanspruchte Basen</span>
+          <button class="sm primary" onclick="sendAction({type:'ForceGlobalGuildPeace'})">🕊 Frieden zwischen allen Gilden erzwingen</button>
+        </h3>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Gilde</th>
+                <th>Gründer & Mitglieder</th>
+                <th>Diplomatie</th>
+                <th>Beanspruchte Basen (GPS & Module)</th>
+                <th>Aktionen</th>
+              </tr>
+            </thead>
+            <tbody id="guilds-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>🚗 Registrierte Fahrzeuge in der Serverwelt</h3>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>ID & Typ</th>
+                <th>Besitzer / Gilde</th>
+                <th>Zustand & Kraftstoff</th>
+                <th>Belegung</th>
+                <th>Standort (GPS)</th>
+                <th>Troubleshooting-Aktionen</th>
+              </tr>
+            </thead>
+            <tbody id="vehicles-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 6: WORLD REGENERATION & BACKUPS -->
+    <section id="tab-maintenance" class="hidden">
+      <div class="grid-2">
+        <div class="card">
+          <h3>💾 Weltspeicher-Snapshots & Backups (<code>saves/backups/</code>)</h3>
+          <p class="muted" style="margin-top:0;">
+            Legt im laufenden Betrieb eine vollständige Sicherheitskopie der Serverwelt an. Vor jedem Welt-Reset wird zusätzlich automatisch ein Backup erstellt.
+          </p>
+          <div class="inline-group" style="margin-bottom:14px;">
+            <input id="backup-label" type="text" placeholder="Notiz (z.B. vor_event)" style="width:210px;">
+            <button class="primary" onclick="createBackup()">💾 Neues Backup anlegen</button>
+          </div>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr><th>Backup-Datei</th><th>Größe</th><th>Erstellt</th><th>Aktion</th></tr>
+              </thead>
+              <tbody id="backups-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <h3>🟣 Alle Risse & Dungeons weltweit erneuern</h3>
+            <p class="muted" style="margin-top:0;">
+              Öffnet sämtliche versiegelten oder stabilisierten Risse auf der gesamten Erde neu und setzt alle Dungeon-Instanzen zurück. <strong>Charaktere, Gilden, Basen und Fahrzeuge bleiben vollständig erhalten!</strong>
+            </p>
+            <button class="brass" onclick="if(confirm('Wirklich alle Risse & Dungeons weltweit frisch öffnen?')) sendAction({type:'ResetAllRiftsGlobal'})">
+              🟣 Alle Risse weltweit zurücksetzen
+            </button>
+          </div>
+
+          <div class="card" style="border-color: var(--danger);">
+            <h3 style="color: var(--danger);">☢ Welt komplett neu generieren (Neuer Welt-Seed)</h3>
+            <p class="muted" style="margin-top:0;">
+              Erstellt automatisch ein Backup der bisherigen Welt, würfelt (oder setzt) einen neuen <code>world_seed</code> und generiert die Welt frisch.
+            </p>
+            <div class="form-row">
+              <label>Neuer Welt-Seed (leer lassen für frischen Zufalls-Seed)</label>
+              <input id="regen-seed" type="number" placeholder="Zufälliger 64-Bit Seed">
+            </div>
+            <div class="form-row" style="margin:8px 0;">
+              <label style="color:var(--text);cursor:pointer;">
+                <input type="checkbox" id="regen-keep-chars" checked>
+                <strong>Charaktere behalten</strong> (Spieler behalten Stufe, Skills & Inventar; nur Welt, Risse, Gilden-Basen & Fahrzeuge werden zurückgesetzt)
+              </label>
+            </div>
+            <div class="form-row">
+              <label>Sicherheitsbestätigung: Bitte <code>RESET</code> eintippen</label>
+              <input id="regen-confirm" type="text" placeholder="RESET">
+            </div>
+            <button class="danger" style="width:100%;" onclick="triggerWorldRegen()">☢ Welt jetzt neu generieren</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+let csrfToken = '';
+let dashState = null;
+let activeTab = 'overview';
+let leafletMap = null;
+let markerLayer = null;
+let targetPin = null;
+
+function showToast(msg, isErr = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = isErr ? 'toast err' : 'toast';
+  el.style.display = 'block';
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => { el.style.display = 'none'; }, 4200);
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtUptime(secs) {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m ${secs % 60}s`;
+}
+
+function fmtDate(unixSecs) {
+  if (!unixSecs) return '—';
+  return new Date(unixSecs * 1000).toLocaleString('de-DE');
+}
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth_status');
+    const j = await r.json();
+    if (j.session_name) {
+      document.getElementById('login-server-title').innerHTML =
+        `Server: <strong>${esc(j.session_name)}</strong> — Anmeldung über <code>server_config.json</code>`;
+    }
+    if (j.authenticated) {
+      csrfToken = j.csrf_token || '';
+      document.getElementById('login-wrap').classList.add('hidden');
+      document.getElementById('app-wrap').classList.remove('hidden');
+      await refreshDashboard();
+    } else {
+      document.getElementById('app-wrap').classList.add('hidden');
+      document.getElementById('login-wrap').classList.remove('hidden');
+    }
+  } catch (e) {
+    showToast('Verbindung zum Server fehlgeschlagen.', true);
+  }
+}
+
+async function doLogin(ev) {
+  ev.preventDefault();
+  document.getElementById('login-err').textContent = '';
+  const username = document.getElementById('login-user').value.trim();
+  const password = document.getElementById('login-pass').value;
+  const r = await fetch('/api/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ username, password })
+  });
+  const j = await r.json();
+  if (r.ok && j.ok) {
+    csrfToken = j.csrf_token || '';
+    document.getElementById('login-pass').value = '';
+    document.getElementById('login-wrap').classList.add('hidden');
+    document.getElementById('app-wrap').classList.remove('hidden');
+    await refreshDashboard();
+  } else {
+    document.getElementById('login-err').textContent = j.error || 'Anmeldung fehlgeschlagen.';
+  }
+}
+
+async function doLogout() {
+  await fetch('/api/logout', { method: 'POST', headers: {'X-CSRF-Token': csrfToken} });
+  csrfToken = '';
+  checkAuth();
+}
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('nav.tabs button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === tab);
+  });
+  ['overview', 'players', 'map', 'bans', 'world_entities', 'maintenance'].forEach(t => {
+    const sec = document.getElementById('tab-' + (t === 'world_entities' ? 'world-entities' : t));
+    if (sec) sec.classList.toggle('hidden', t !== tab);
+  });
+  if (tab === 'map') {
+    initMapIfNeeded();
+    setTimeout(() => { if (leafletMap) leafletMap.invalidateSize(); renderMapMarkers(); }, 60);
+  }
+}
+
+async function sendAction(payload) {
+  try {
+    const r = await fetch('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify(payload)
+    });
+    if (r.status === 401) { checkAuth(); return; }
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      showToast(j.error || 'Aktion fehlgeschlagen.', true);
+      return;
+    }
+    if (j.message) showToast(j.message, false);
+    if (j.state) {
+      dashState = j.state;
+      renderAll();
+    } else {
+      await refreshDashboard();
+    }
+  } catch (e) {
+    showToast('Netzwerkfehler bei Admin-Aktion.', true);
+  }
+}
+
+async function refreshDashboard() {
+  try {
+    const r = await fetch('/api/dashboard');
+    if (r.status === 401) { checkAuth(); return; }
+    if (!r.ok) return;
+    dashState = await r.json();
+    renderAll();
+  } catch (_) {}
+}
+
+function renderAll() {
+  if (!dashState) return;
+  const s = dashState;
+  document.getElementById('hdr-name').textContent = s.session_name;
+  const hib = document.getElementById('hdr-hib');
+  hib.textContent = s.hibernating ? '💤 0%-CPU Ruhemodus' : '🟢 Simulation aktiv';
+  hib.className = 'pill ' + (s.hibernating ? 'warn' : 'ok');
+  document.getElementById('hdr-players').textContent = `${s.online_players} / ${s.max_players} Spieler`;
+  const offTxt = s.world_level_offset !== 0 ? ` (${s.world_level_offset > 0 ? '+' : ''}${s.world_level_offset})` : '';
+  document.getElementById('hdr-tier').textContent = `Weltstufe ${s.world_tier}${offTxt}`;
+  const hh = Math.floor(s.world_hour);
+  const mm = Math.floor((s.world_hour - hh) * 60);
+  document.getElementById('hdr-hour').textContent = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')} Uhr`;
+  document.getElementById('hdr-seed').textContent = `Seed: ${s.world_seed}`;
+  document.getElementById('hdr-uptime').textContent = `Laufzeit: ${fmtUptime(s.uptime_secs)}`;
+  document.getElementById('cnt-chars').textContent = s.characters.length;
+  document.getElementById('cnt-bans').textContent = s.bans.length;
+
+  // Overview inputs (update only when not focused)
+  if (document.activeElement?.id !== 'inp-world-tier') document.getElementById('inp-world-tier').value = s.world_tier;
+  if (document.activeElement?.id !== 'inp-level-offset') document.getElementById('inp-level-offset').value = s.world_level_offset;
+  if (document.activeElement?.id !== 'inp-day-secs') document.getElementById('inp-day-secs').value = Math.round(s.ingame_day_real_secs);
+  if (document.activeElement?.id !== 'cfg-session-name') document.getElementById('cfg-session-name').value = s.session_name;
+  if (document.activeElement?.id !== 'cfg-max-players') document.getElementById('cfg-max-players').value = s.max_players;
+  if (document.activeElement?.id !== 'cfg-password') document.getElementById('cfg-password').value = s.server_password || '';
+  if (document.activeElement?.id !== 'cfg-pause-empty') document.getElementById('cfg-pause-empty').checked = s.pause_when_empty;
+
+  const tierNames = { 0: 'Weltstufe 0 (Einsteiger / Halbe Stufe)', 1: 'Weltstufe 1 (Standard)' };
+  document.getElementById('ov-tier-lbl').textContent = tierNames[s.world_tier] || `Weltstufe ${s.world_tier}`;
+  document.getElementById('ov-rift-preview').textContent =
+    `Resultierende Riss-Stufen weltweit: Stufe ${s.sample_min_rift_level} – ${s.sample_max_rift_level}  •  Aktive Riss-Sektoren im Speicher: ${s.cached_rift_chunks}  •  Versiegelte Portale: ${s.sealed_portal_count}`;
+
+  // Event log
+  const logEl = document.getElementById('event-log');
+  logEl.innerHTML = (s.recent_events || []).slice().reverse().map(ev =>
+    `<div class="log-line"><span class="muted">[${esc(ev.time)}]</span> ${esc(ev.text)}</div>`
+  ).join('') || '<div class="muted">Noch keine Ereignisse protokolliert.</div>';
+
+  renderPlayersTable();
+  renderBansTable();
+  renderGuildsAndVehicles();
+  renderBackupsTable();
+  populatePlayerDropdowns();
+  if (activeTab === 'map') renderMapMarkers();
+}
+
+function renderPlayersTable() {
+  if (!dashState) return;
+  const q = (document.getElementById('char-filter').value || '').toLowerCase().trim();
+  const rows = dashState.characters.filter(c => {
+    if (!q) return true;
+    return [c.name, c.device_fingerprint, c.pubkey_hex, c.guild_name, c.last_ip, String(c.uid)]
+      .some(v => String(v || '').toLowerCase().includes(q));
+  });
+  const tb = document.getElementById('players-tbody');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="muted">Keine passenden Charaktere gefunden.</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(c => {
+    const statusBadge = c.online
+      ? `<span class="pill ok">🟢 Online</span>`
+      : `<span class="pill muted">⚪ Offline</span>`;
+    const coordStr = `${c.lat.toFixed(4)}° N, ${c.lon.toFixed(4)}° E`;
+    const fp = c.device_fingerprint || 'Noch kein Schlüssel';
+    return `<tr>
+      <td>${statusBadge}</td>
+      <td><strong>${esc(c.name)}</strong><br><span class="muted">Stufe ${c.level} • ${esc(c.role_label)}</span></td>
+      <td>${c.guild_name ? esc(c.guild_name) + ' <span class="muted">(' + esc(c.guild_role) + ')</span>' : '<span class="muted">—</span>'}</td>
+      <td>${esc(c.dimension)}<br><a href="#" style="color:var(--cyan);" onclick="focusMapOn(${c.lat},${c.lon});return false;">📍 ${coordStr}</a></td>
+      <td class="mono">
+        <span style="color:var(--emerald);">${esc(fp)}</span><br>
+        <span class="muted">UID: ${c.uid}</span>
+        ${c.pubkey_hex ? `<button class="sm" style="margin-left:4px;padding:1px 5px;" title="Vollständigen Ed25519-Key kopieren" onclick="navigator.clipboard.writeText('${esc(c.pubkey_hex)}');showToast('Public-Key kopiert!')">Key</button>` : ''}
+      </td>
+      <td class="mono">${esc(c.last_ip || '—')}<br><span class="muted">${fmtDate(c.last_seen_unix)}</span></td>
+      <td>
+        <div class="actions">
+          <button class="sm" title="Aus Dungeon/Gebäude auf sichere Oberwelt setzen" onclick="unstuckPlayer(${c.uid}, '${esc(c.name)}')">🚑 Unstuck</button>
+          <button class="sm" onclick="promptTeleportPlayer(${c.uid}, '${esc(c.name)}', ${c.lat}, ${c.lon})">⚡ Teleport</button>
+          <button class="sm" onclick="promptSetLevel(${c.uid}, '${esc(c.name)}', ${c.level})">Stufe</button>
+          ${c.online ? `<button class="sm" onclick="promptKick(${c.uid}, '${esc(c.name)}')">👢 Kick</button>` : ''}
+          <button class="sm danger" onclick="promptBanCharacter(${c.uid}, '${esc(c.name)}', '${esc(c.pubkey_hex)}', '${esc(c.device_fingerprint)}', '${esc(c.last_ip || '')}')">🚫 Device-Ban</button>
+          <button class="sm danger" onclick="confirmDeleteChar(${c.uid}, '${esc(c.name)}')">🗑</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function renderBansTable() {
+  const tb = document.getElementById('bans-tbody');
+  const bans = dashState?.bans || [];
+  if (!bans.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="muted">Aktuell sind keine Geräte oder Spieler gesperrt.</td></tr>';
+    return;
+  }
+  tb.innerHTML = bans.map(b => `<tr>
+    <td class="mono">#${b.ban_id}</td>
+    <td><strong>${esc(b.player_name || 'Unbekannt')}</strong></td>
+    <td class="mono"><span style="color:var(--danger);">${esc(b.device_fingerprint || '—')}</span><br><span class="muted">${esc((b.pubkey_hex || '').slice(0, 24))}${b.pubkey_hex ? '…' : ''}</span></td>
+    <td class="mono">UID: ${b.player_uid ?? '—'}<br>IP: ${esc(b.ip_address || '—')}</td>
+    <td>${esc(b.reason)}</td>
+    <td class="muted">${fmtDate(b.banned_at_unix_secs)}</td>
+    <td><button class="sm primary" onclick="sendAction({type:'UnbanDevice', ban_id:${b.ban_id}})">✓ Entbannen</button></td>
+  </tr>`).join('');
+}
+
+function renderGuildsAndVehicles() {
+  const gtb = document.getElementById('guilds-tbody');
+  const guilds = dashState?.guilds || [];
+  if (!guilds.length) {
+    gtb.innerHTML = '<tr><td colspan="5" class="muted">Keine Spieler-Gilden vorhanden.</td></tr>';
+  } else {
+    gtb.innerHTML = guilds.map(g => {
+      const basesHtml = (g.bases || []).map(b =>
+        `<div style="margin-bottom:4px;">
+          🏰 <strong>${esc(b.name)}</strong> (${b.module_count} Module, <a href="#" style="color:var(--cyan);" onclick="focusMapOn(${b.lat},${b.lon});return false;">${b.lat.toFixed(4)}°, ${b.lon.toFixed(4)}°</a>)
+          <button class="sm danger" style="padding:1px 6px;margin-left:4px;" onclick="if(confirm('Basis wirklich entfernen?'))sendAction({type:'DeleteBase',guild_id:${g.guild_id},building_id:${b.building_id}})">Basis löschen</button>
+        </div>`
+      ).join('') || '<span class="muted">Keine Basis</span>';
+      return `<tr>
+        <td><strong>${esc(g.name)}</strong><br><span class="muted mono">Gilde #${g.guild_id}</span></td>
+        <td>Gründer: <strong>${esc(g.founder_name)}</strong><br><span class="muted">${g.member_count} Mitglied(er)</span></td>
+        <td>${g.hostile_wars > 0 ? `<span class="pill warn">⚔ ${g.hostile_wars} Krieg(e)</span>` : `<span class="pill ok">🕊 Friedlich</span>`}</td>
+        <td>${basesHtml}</td>
+        <td><button class="sm danger" onclick="if(confirm('Gesamte Gilde ${esc(g.name)} auflösen?'))sendAction({type:'DisbandGuild',guild_id:${g.guild_id}})">🗑 Gilde auflösen</button></td>
+      </tr>`;
+    }).join('');
+  }
+
+  const vtb = document.getElementById('vehicles-tbody');
+  const vehs = dashState?.vehicles || [];
+  if (!vehs.length) {
+    vtb.innerHTML = '<tr><td colspan="6" class="muted">Keine Spieler-Fahrzeuge registriert.</td></tr>';
+  } else {
+    vtb.innerHTML = vehs.map(v => `<tr>
+      <td><strong>${esc(v.label_de)}</strong><br><span class="muted mono">#${v.vehicle_id}</span></td>
+      <td>${esc(v.owner_label)}</td>
+      <td>Karosserie: ${v.body_pct.toFixed(0)}% • Reifen: ${v.tires_pct.toFixed(0)}%<br><span class="muted">Tank: ${v.fuel_liters.toFixed(1)} L</span></td>
+      <td>${v.driver_uid ? `🟢 Fahrer UID ${v.driver_uid}` : '<span class="muted">Frei</span>'} (${v.passenger_count} Beifahrer)</td>
+      <td><a href="#" style="color:var(--cyan);" onclick="focusMapOn(${v.lat},${v.lon});return false;">📍 ${v.lat.toFixed(4)}°, ${v.lon.toFixed(4)}°</a></td>
+      <td>
+        <div class="actions">
+          <button class="sm primary" onclick="sendAction({type:'RepairAndRefuelVehicle',vehicle_id:${v.vehicle_id}})">⛽ Tanken & Reparieren</button>
+          <button class="sm" onclick="sendAction({type:'UnlockVehicleSeats',vehicle_id:${v.vehicle_id}})">🔓 Sitz freigeben</button>
+          <button class="sm danger" onclick="if(confirm('Fahrzeug löschen?'))sendAction({type:'DeleteVehicle',vehicle_id:${v.vehicle_id}})">🗑</button>
+        </div>
+      </td>
+    </tr>`).join('');
+  }
+}
+
+function renderBackupsTable() {
+  const tb = document.getElementById('backups-tbody');
+  const list = dashState?.backups || [];
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="muted">Noch keine Snapshots im Backup-Ordner vorhanden.</td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(b => `<tr>
+    <td class="mono">${esc(b.filename)}</td>
+    <td>${(b.size_bytes / 1024).toFixed(1)} KB</td>
+    <td class="muted">${fmtDate(b.modified_unix)}</td>
+    <td>
+      <button class="sm brass" onclick="if(confirm('Serverwelt wirklich auf Snapshot ${esc(b.filename)} zurücksetzen? Eingeloggte Spieler werden kurz getrennt.'))sendAction({type:'RestoreBackup',filename:'${esc(b.filename)}'})">
+        ⏪ Wiederherstellen
+      </button>
+    </td>
+  </tr>`).join('');
+}
+
+function populatePlayerDropdowns() {
+  const chars = dashState?.characters || [];
+  const areaSel = document.getElementById('area-player-select');
+  const tpSel = document.getElementById('tp-player-select');
+  const curTp = tpSel.value;
+  areaSel.innerHTML = '<option value="">— Spieler-Standort übernehmen —</option>' +
+    chars.map(c => `<option value="${c.lat},${c.lon}">${esc(c.name)} (Stufe ${c.level}, ${c.online ? 'Online' : 'Offline'})</option>`).join('');
+  tpSel.innerHTML = '<option value="">— Spieler wählen —</option>' +
+    chars.map(c => `<option value="${c.uid}">${esc(c.name)} (UID ${c.uid}, ${c.online ? 'Online' : 'Offline'})</option>`).join('');
+  if (curTp) tpSel.value = curTp;
+}
+
+// --- MAP ---
+function initMapIfNeeded() {
+  if (leafletMap || typeof L === 'undefined') return;
+  leafletMap = L.map('admin-map').setView([51.1657, 10.4515], 6);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(leafletMap);
+  markerLayer = L.layerGroup().addTo(leafletMap);
+  leafletMap.on('click', e => {
+    const lat = e.latlng.lat;
+    const lon = e.latlng.lng;
+    document.getElementById('area-lat').value = lat.toFixed(5);
+    document.getElementById('area-lon').value = lon.toFixed(5);
+    setTargetPin(lat, lon);
+  });
+  renderMapMarkers();
+  fitMapToMarkers();
+}
+
+function setTargetPin(lat, lon) {
+  if (!leafletMap || typeof L === 'undefined') return;
+  if (targetPin) leafletMap.removeLayer(targetPin);
+  targetPin = L.circle([lat, lon], {
+    radius: parseFloat(document.getElementById('area-radius').value || '2.5') * 1000,
+    color: '#d8b168',
+    weight: 2,
+    fillOpacity: 0.12
+  }).addTo(leafletMap);
+}
+
+function renderMapMarkers() {
+  if (!leafletMap || !markerLayer || !dashState) return;
+  markerLayer.clearLayers();
+  const dot = (lat, lon, col, label) => {
+    L.circleMarker([lat, lon], { radius: 7, color: '#000', weight: 1.5, fillColor: col, fillOpacity: 0.92 })
+      .bindPopup(label)
+      .addTo(markerLayer);
+  };
+  (dashState.rifts_preview || []).forEach(r =>
+    dot(r.lat, r.lon, '#b55cff', `🟣 Riss #${r.id} (Stufe ${r.level}) — ${esc(r.theme)}`)
+  );
+  (dashState.vehicles || []).forEach(v =>
+    dot(v.lat, v.lon, '#5ed3f3', `🚗 ${esc(v.label_de)} (${v.fuel_liters.toFixed(1)} L)`)
+  );
+  (dashState.guilds || []).forEach(g =>
+    (g.bases || []).forEach(b =>
+      dot(b.lat, b.lon, '#d8b168', `🏰 Basis '${esc(b.name)}' — Gilde '${esc(g.name)}'`)
+    )
+  );
+  (dashState.characters || []).forEach(c =>
+    dot(c.lat, c.lon, c.online ? '#3ad29f' : '#8fa0b5',
+      `${c.online ? '🟢' : '⚪'} <strong>${esc(c.name)}</strong> (Stufe ${c.level})<br>${esc(c.dimension)}`)
+  );
+}
+
+function fitMapToMarkers() {
+  if (!leafletMap || !dashState) return;
+  const pts = [];
+  (dashState.characters || []).forEach(c => { if (Math.abs(c.lat) > 0.01 || Math.abs(c.lon) > 0.01) pts.push([c.lat, c.lon]); });
+  (dashState.guilds || []).forEach(g => (g.bases || []).forEach(b => pts.push([b.lat, b.lon])));
+  if (pts.length) leafletMap.fitBounds(pts, { padding: [40, 40], maxZoom: 13 });
+}
+
+function focusMapOn(lat, lon) {
+  switchTab('map');
+  document.getElementById('area-lat').value = lat.toFixed(5);
+  document.getElementById('area-lon').value = lon.toFixed(5);
+  setTimeout(() => {
+    if (leafletMap) {
+      leafletMap.setView([lat, lon], 14);
+      setTargetPin(lat, lon);
+    }
+  }, 90);
+}
+
+// --- ACTIONS ---
+function stepWorldTier(delta) {
+  const cur = dashState ? dashState.world_tier : 1;
+  const next = Math.max(0, Math.min(50, cur + delta));
+  const off = parseInt(document.getElementById('inp-level-offset').value || '0', 10) || 0;
+  sendAction({ type: 'SetWorldDifficulty', world_tier: next, world_level_offset: off });
+}
+
+function applyWorldDifficulty() {
+  const tier = parseInt(document.getElementById('inp-world-tier').value || '1', 10);
+  const off = parseInt(document.getElementById('inp-level-offset').value || '0', 10);
+  sendAction({ type: 'SetWorldDifficulty', world_tier: isNaN(tier) ? 1 : tier, world_level_offset: isNaN(off) ? 0 : off });
+}
+
+function setWorldHour(h) {
+  if (isNaN(h)) return;
+  sendAction({ type: 'SetWorldTime', world_hour: h, ingame_day_real_secs: null });
+}
+
+function applyDayLength() {
+  const secs = parseFloat(document.getElementById('inp-day-secs').value || '1440');
+  const h = dashState ? dashState.world_hour : 14.0;
+  sendAction({ type: 'SetWorldTime', world_hour: h, ingame_day_real_secs: secs });
+}
+
+function sendBroadcast() {
+  const el = document.getElementById('inp-broadcast');
+  const txt = el.value.trim();
+  if (!txt) return;
+  el.value = '';
+  sendAction({ type: 'BroadcastMessage', text: txt });
+}
+
+function saveServerSettings() {
+  sendAction({
+    type: 'UpdateServerSettings',
+    session_name: document.getElementById('cfg-session-name').value.trim(),
+    max_players: parseInt(document.getElementById('cfg-max-players').value || '12', 10),
+    password: document.getElementById('cfg-password').value,
+    pause_when_empty: document.getElementById('cfg-pause-empty').checked
+  });
+}
+
+function unstuckPlayer(uid, name) {
+  if (!confirm(`'${name}' aus aktuellem Dungeon/Gebäude auf seine letzte sichere Oberwelt-Position retten?`)) return;
+  sendAction({ type: 'TeleportOrUnstuckPlayer', player_uid: uid, lat: null, lon: null, unstuck_to_overworld: true });
+}
+
+function promptTeleportPlayer(uid, name, curLat, curLon) {
+  const raw = prompt(`Ziel-GPS (Lat, Lon) für '${name}' eingeben:`, `${curLat.toFixed(5)}, ${curLon.toFixed(5)}`);
+  if (!raw) return;
+  const parts = raw.split(',').map(s => parseFloat(s.trim()));
+  if (parts.length !== 2 || isNaN(parts[0]) || isNaN(parts[1])) {
+    showToast('Ungültiges Format — bitte "Lat, Lon" eingeben.', true);
+    return;
+  }
+  sendAction({ type: 'TeleportOrUnstuckPlayer', player_uid: uid, lat: parts[0], lon: parts[1], unstuck_to_overworld: true });
+}
+
+function promptSetLevel(uid, name, curLvl) {
+  const raw = prompt(`Neue Charakterstufe für '${name}' (1–500):`, String(curLvl));
+  if (!raw) return;
+  const lvl = parseInt(raw, 10);
+  if (isNaN(lvl) || lvl < 1) return;
+  sendAction({ type: 'SetCharacterLevel', player_uid: uid, new_level: lvl });
+}
+
+function promptKick(uid, name) {
+  const reason = prompt(`Grund für den Kick von '${name}':`, 'Vom Administrator getrennt.');
+  if (reason === null) return;
+  sendAction({ type: 'KickPlayer', player_uid: uid, reason });
+}
+
+function promptBanCharacter(uid, name, pubkeyHex, fp, lastIp) {
+  const reason = prompt(`Gerät (${fp || 'UID ' + uid}) von '${name}' dauerhaft sperren — Sperrgrund:`, 'Regelverstoß');
+  if (reason === null) return;
+  const alsoDel = confirm(`Soll zusätzlich auch der Charakter '${name}' und eine ggf. von ihm gegründete Gilde gelöscht werden?\n(OK = Ja, auch löschen  |  Abbrechen = Nur Gerät sperren)`);
+  sendAction({
+    type: 'BanDevice',
+    player_uid: uid,
+    pubkey_hex: pubkeyHex || '',
+    device_fingerprint: fp || '',
+    ip_address: lastIp ? lastIp : null,
+    player_name: name,
+    reason: reason || 'Vom Administrator gesperrt',
+    delete_character: alsoDel
+  });
+}
+
+function confirmDeleteChar(uid, name) {
+  if (!confirm(`Charakter '${name}' (UID ${uid}) inklusive Gründer-Gilde unwiderruflich vom Server löschen?`)) return;
+  sendAction({ type: 'DeleteCharacter', player_uid: uid });
+}
+
+function submitManualBan() {
+  const dev = document.getElementById('ban-device').value.trim();
+  const uidRaw = document.getElementById('ban-uid').value.trim();
+  const ip = document.getElementById('ban-ip').value.trim();
+  const name = document.getElementById('ban-name').value.trim() || 'Manueller Eintrag';
+  const reason = document.getElementById('ban-reason').value.trim() || 'Vom Administrator gesperrt';
+  if (!dev && !uidRaw && !ip) {
+    showToast('Bitte mindestens eine Device-ID, einen Public-Key, eine UID oder eine IP angeben.', true);
+    return;
+  }
+  const isHexKey = /^[0-9a-fA-F]{64}$/.test(dev);
+  sendAction({
+    type: 'BanDevice',
+    player_uid: uidRaw ? parseInt(uidRaw, 10) : null,
+    pubkey_hex: isHexKey ? dev.toLowerCase() : '',
+    device_fingerprint: !isHexKey ? dev.toUpperCase() : '',
+    ip_address: ip || null,
+    player_name: name,
+    reason,
+    delete_character: false
+  });
+  document.getElementById('ban-device').value = '';
+  document.getElementById('ban-uid').value = '';
+  document.getElementById('ban-ip').value = '';
+}
+
+function pickPlayerForCoords(val) {
+  if (!val) return;
+  const [lat, lon] = val.split(',').map(Number);
+  if (!isNaN(lat) && !isNaN(lon)) focusMapOn(lat, lon);
+}
+
+function triggerAreaReset() {
+  const lat = parseFloat(document.getElementById('area-lat').value);
+  const lon = parseFloat(document.getElementById('area-lon').value);
+  const radius_km = parseFloat(document.getElementById('area-radius').value || '2.5');
+  if (isNaN(lat) || isNaN(lon)) return;
+  if (!confirm(`Bereich um (${lat.toFixed(4)}°, ${lon.toFixed(4)}°) im Radius von ${radius_km} km jetzt zurücksetzen?`)) return;
+  sendAction({
+    type: 'ResetArea',
+    lat, lon, radius_km,
+    reset_rifts: document.getElementById('ar-rifts').checked,
+    restore_buildings: document.getElementById('ar-bldgs').checked,
+    remove_vehicles: document.getElementById('ar-vehs').checked,
+    remove_bases: document.getElementById('ar-bases').checked
+  });
+}
+
+function teleportSelectedPlayerToAreaCoords() {
+  const uid = parseInt(document.getElementById('tp-player-select').value || '0', 10);
+  const lat = parseFloat(document.getElementById('area-lat').value);
+  const lon = parseFloat(document.getElementById('area-lon').value);
+  if (!uid) { showToast('Bitte zuerst einen Ziel-Spieler auswählen.', true); return; }
+  sendAction({ type: 'TeleportOrUnstuckPlayer', player_uid: uid, lat, lon, unstuck_to_overworld: true });
+}
+
+function createBackup() {
+  const label = document.getElementById('backup-label').value.trim();
+  document.getElementById('backup-label').value = '';
+  sendAction({ type: 'CreateBackup', label });
+}
+
+function triggerWorldRegen() {
+  if (document.getElementById('regen-confirm').value.trim() !== 'RESET') {
+    showToast('Bitte zur Bestätigung exakt RESET in das Sicherheitsfeld eintippen.', true);
+    return;
+  }
+  const seedRaw = document.getElementById('regen-seed').value.trim();
+  const keep = document.getElementById('regen-keep-chars').checked;
+  document.getElementById('regen-confirm').value = '';
+  sendAction({
+    type: 'RegenerateWorld',
+    new_seed: seedRaw ? parseInt(seedRaw, 10) : null,
+    keep_characters: keep
+  });
+}
+
+setInterval(() => {
+  if (!document.getElementById('app-wrap').classList.contains('hidden') &&
+      document.getElementById('auto-refresh').checked) {
+    refreshDashboard();
+  }
+}, 3000);
+
+checkAuth();
+</script>
+</body>
+</html>
