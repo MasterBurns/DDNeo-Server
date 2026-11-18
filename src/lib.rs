@@ -12,8 +12,145 @@ pub const DEFAULT_SERVER_PORT: u16 = 27777;
 pub const LAN_DISCOVERY_PORT: u16 = 27778;
 pub const DEFAULT_EMBEDDED_MAX_PLAYERS: u8 = 4;
 pub const DEFAULT_DEDICATED_MAX_PLAYERS: u8 = 12;
-pub const PROTOCOL_VERSION: u32 = 6;
-pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V6";
+pub const PROTOCOL_VERSION: u32 = 7;
+pub const LAN_DISCOVER_MAGIC: &[u8] = b"DDNEO_DISCOVER_V7";
+pub const AUTH_ACTION_HELLO: &str = "HELLO";
+pub const AUTH_ACTION_DELETE_CHAR: &str = "DELETE_CHARACTER";
+
+/// Converts a 32-byte array to lowercase 64-char hex without external crate overhead.
+pub fn bytes32_to_hex(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Parses a 64-char hex string back into a 32-byte array.
+pub fn hex_to_bytes32(hex: &str) -> Option<[u8; 32]> {
+    let clean = hex.trim();
+    if clean.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let bytes = clean.as_bytes();
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[i * 2] as char).to_digit(16)? as u8;
+        let lo = (bytes[i * 2 + 1] as char).to_digit(16)? as u8;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+pub fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
+}
+
+pub fn pubkey_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes()
+}
+
+/// Derives a canonical non-zero 64-bit `player_uid` from an Ed25519 public key.
+pub fn derive_uid_from_pubkey(pubkey: &[u8; 32]) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"DDNEO_UID_V1:");
+    hasher.update(pubkey);
+    let digest = hasher.finalize();
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(raw) | 1
+}
+
+/// Human-readable short fingerprint (`ED25519-XXXX-XXXX-XXXX`) shown in the Character Manager UI.
+pub fn format_pubkey_fingerprint(pubkey: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"DDNEO_FP_V1:");
+    hasher.update(pubkey);
+    let d = hasher.finalize();
+    format!(
+        "ED25519-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}",
+        d[0], d[1], d[2], d[3], d[4], d[5]
+    )
+}
+
+fn build_auth_digest(
+    action: &str,
+    player_uid: u64,
+    timestamp_ms: u64,
+    pubkey: &[u8; 32],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"DDNEO_AUTH_V7:");
+    hasher.update(action.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(player_uid.to_le_bytes());
+    hasher.update(timestamp_ms.to_le_bytes());
+    hasher.update(pubkey);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Signs a server action (`HELLO` or `DELETE_CHARACTER`) with the player's 32-byte Ed25519 seed.
+/// Returns `(pubkey, sig_r, sig_s)`.
+pub fn sign_auth_action(
+    seed: &[u8; 32],
+    action: &str,
+    player_uid: u64,
+    timestamp_ms: u64,
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    use ed25519_dalek::{Signer, SigningKey};
+    let sk = SigningKey::from_bytes(seed);
+    let pk = sk.verifying_key().to_bytes();
+    let digest = build_auth_digest(action, player_uid, timestamp_ms, &pk);
+    let sig_bytes = sk.sign(&digest).to_bytes();
+    let mut sig_r = [0u8; 32];
+    let mut sig_s = [0u8; 32];
+    sig_r.copy_from_slice(&sig_bytes[..32]);
+    sig_s.copy_from_slice(&sig_bytes[32..]);
+    (pk, sig_r, sig_s)
+}
+
+/// Verifies an Ed25519 signature over `(action, player_uid, timestamp_ms, pubkey)`.
+pub fn verify_auth_action(
+    pubkey: &[u8; 32],
+    action: &str,
+    player_uid: u64,
+    timestamp_ms: u64,
+    sig_r: &[u8; 32],
+    sig_s: &[u8; 32],
+) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    if *pubkey == [0u8; 32] || timestamp_ms == 0 {
+        return Err("Fehlende Spielersignatur (ungültiger öffentlicher Schlüssel).".to_string());
+    }
+    let now_ms = current_unix_ms();
+    if now_ms.abs_diff(timestamp_ms) > 24 * 3_600 * 1_000 {
+        return Err(
+            "Signatur-Zeitstempel abgelaufen (bitte Systemuhr prüfen).".to_string(),
+        );
+    }
+    let vk = VerifyingKey::from_bytes(pubkey)
+        .map_err(|_| "Ungültiger Ed25519 Public-Key.".to_string())?;
+    let mut sig64 = [0u8; 64];
+    sig64[..32].copy_from_slice(sig_r);
+    sig64[32..].copy_from_slice(sig_s);
+    let sig = Signature::from_bytes(&sig64);
+    let digest = build_auth_digest(action, player_uid, timestamp_ms, pubkey);
+    vk.verify(&digest, &sig)
+        .map_err(|_| "Ed25519-Signaturprüfung fehlgeschlagen!".to_string())
+}
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
 const LOCAL_INTEREST_RADIUS_M: f64 = 1_850.0;
@@ -312,6 +449,15 @@ pub enum NetClientMsg {
         protocol_version: u32,
         player_uid: u64,
     },
+    DeleteServerCharacter {
+        protocol_version: u32,
+        player_uid: u64,
+        password: String,
+        pubkey: [u8; 32],
+        auth_timestamp_ms: u64,
+        sig_r: [u8; 32],
+        sig_s: [u8; 32],
+    },
     Hello {
         protocol_version: u32,
         player_uid: u64,
@@ -322,6 +468,10 @@ pub enum NetClientMsg {
         appearance_bytes: [u8; 24],
         net_pos: NetWorldPos,
         reset_character: bool,
+        pubkey: [u8; 32],
+        auth_timestamp_ms: u64,
+        sig_r: [u8; 32],
+        sig_s: [u8; 32],
     },
     FastState {
         net_pos: NetWorldPos,
@@ -433,6 +583,11 @@ pub enum NetServerMsg {
         has_password: bool,
         is_dedicated: bool,
         existing_character: Option<ServerCharacterSummary>,
+    },
+    CharacterDeleteReply {
+        ok: bool,
+        deleted_name: String,
+        message: String,
     },
     Welcome {
         server_name: String,
@@ -713,6 +868,64 @@ pub fn peek_saved_character_summary(save_path: &str, player_uid: u64) -> Option<
     })
 }
 
+/// Deletes a specific player's character (and founder guild / personal vehicles) directly inside a
+/// local server world file (`saves/embedded_mp_world.bin`) when the Koop server is offline.
+pub fn delete_local_character_in_world_file(
+    save_path: &str,
+    player_uid: u64,
+) -> Result<Option<String>, String> {
+    let path = Path::new(save_path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut saved =
+        bincode::deserialize::<PersistedServerWorld>(&bytes).map_err(|e| e.to_string())?;
+
+    let mut deleted_name = None;
+    saved.characters.retain(|c| {
+        if c.player_uid == player_uid {
+            deleted_name = Some(c.player_name.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if deleted_name.is_none() {
+        return Ok(None);
+    }
+
+    let mut disbanded_guilds = HashSet::new();
+    saved.guilds.retain_mut(|g| {
+        if g.founder_uid == player_uid {
+            disbanded_guilds.insert(g.guild_id);
+            false
+        } else {
+            g.members.retain(|m| m.uid != player_uid);
+            g.pending_invites.retain(|&u| u != player_uid);
+            true
+        }
+    });
+    for g in &mut saved.guilds {
+        for d_gid in &disbanded_guilds {
+            g.stances.remove(d_gid);
+        }
+    }
+    saved.vehicles.retain(|v| {
+        let in_disbanded = v
+            .guild_id
+            .map_or(false, |gid| disbanded_guilds.contains(&gid));
+        let personal_owned = v.owner_uid == player_uid && v.guild_id.is_none();
+        !in_disbanded && !personal_owned
+    });
+
+    let out_bytes = bincode::serialize(&saved).map_err(|e| e.to_string())?;
+    let tmp_path = format!("{}.tmp", save_path);
+    std::fs::write(&tmp_path, &out_bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+    Ok(deleted_name)
+}
+
 #[derive(Default)]
 struct LiveDungeonInstance {
     killed_by_floor: HashMap<u32, HashSet<u64>>,
@@ -727,6 +940,7 @@ struct ServerWorldHub {
     world_hour: f32,
     peers: HashMap<u64, ConnectedPeer>,
     characters: HashMap<u64, WireServerCharacter>,
+    registered_pubkeys: HashMap<u64, [u8; 32]>,
     guilds: HashMap<u64, WirePlayerGuild>,
     vehicles: HashMap<u64, WireVehicle>,
     dungeons: HashMap<u64, LiveDungeonInstance>,
@@ -751,6 +965,7 @@ impl ServerWorldHub {
             world_hour: 14.0,
             peers: HashMap::new(),
             characters: HashMap::new(),
+            registered_pubkeys: HashMap::new(),
             guilds: HashMap::new(),
             vehicles: HashMap::new(),
             dungeons: HashMap::new(),
@@ -773,6 +988,16 @@ impl ServerWorldHub {
         let Some(ref path_str) = self.config.world_save_path else {
             return;
         };
+        let keys_path_str = format!("{}.keys.json", path_str);
+        if let Ok(keys_txt) = std::fs::read_to_string(&keys_path_str) {
+            if let Ok(raw_map) = serde_json::from_str::<HashMap<u64, String>>(&keys_txt) {
+                for (uid, hex_pk) in raw_map {
+                    if let Some(pk) = hex_to_bytes32(&hex_pk) {
+                        self.registered_pubkeys.insert(uid, pk);
+                    }
+                }
+            }
+        }
         let path = Path::new(path_str);
         if !path.exists() {
             self.dirty = true;
@@ -809,9 +1034,10 @@ impl ServerWorldHub {
                     self.stabilized_portals = saved.stabilized_portals.into_iter().collect();
                     if self.config.is_dedicated {
                         println!(
-                            "[DDNeo-Server] Weltstatus geladen aus '{}': {} Charaktere, {} Gilden, {} Fahrzeuge, {} Risse versiegelt (Seed {}).",
+                            "[DDNeo-Server] Weltstatus geladen aus '{}': {} Charaktere ({} Schlüssel gebunden), {} Gilden, {} Fahrzeuge, {} Risse versiegelt (Seed {}).",
                             path_str,
                             self.characters.len(),
+                            self.registered_pubkeys.len(),
                             self.guilds.len(),
                             self.vehicles.len(),
                             self.sealed_portals.len(),
@@ -870,7 +1096,50 @@ impl ServerWorldHub {
                 self.last_save_at = Instant::now();
             }
         }
+        let keys_map: HashMap<u64, String> = self
+            .registered_pubkeys
+            .iter()
+            .map(|(&uid, pk)| (uid, bytes32_to_hex(pk)))
+            .collect();
+        if let Ok(keys_json) = serde_json::to_string_pretty(&keys_map) {
+            let keys_path = format!("{}.keys.json", path_str);
+            let keys_tmp = format!("{}.keys.json.tmp", path_str);
+            if std::fs::write(&keys_tmp, keys_json).is_ok() {
+                let _ = std::fs::rename(&keys_tmp, &keys_path);
+            }
+        }
         self.write_status_json();
+    }
+
+    fn verify_and_bind_uid(
+        &mut self,
+        player_uid: u64,
+        pubkey: &[u8; 32],
+        action: &str,
+        auth_timestamp_ms: u64,
+        sig_r: &[u8; 32],
+        sig_s: &[u8; 32],
+    ) -> Result<(), String> {
+        verify_auth_action(
+            pubkey,
+            action,
+            player_uid,
+            auth_timestamp_ms,
+            sig_r,
+            sig_s,
+        )?;
+        if let Some(bound_pk) = self.registered_pubkeys.get(&player_uid) {
+            if bound_pk != pubkey {
+                return Err(
+                    "Kryptografische Signatur stimmt nicht mit dem Besitzer dieser Spieler-ID überein!"
+                        .to_string(),
+                );
+            }
+        } else {
+            self.registered_pubkeys.insert(player_uid, *pubkey);
+            self.dirty = true;
+        }
+        Ok(())
     }
 
     fn write_status_json(&self) {
@@ -1057,7 +1326,9 @@ impl ServerWorldHub {
 
     fn handle_msg(&mut self, uid: u64, msg: NetClientMsg) {
         match msg {
-            NetClientMsg::ProbeServer { .. } | NetClientMsg::Hello { .. } => {}
+            NetClientMsg::ProbeServer { .. }
+            | NetClientMsg::DeleteServerCharacter { .. }
+            | NetClientMsg::Hello { .. } => {}
             NetClientMsg::FastState {
                 net_pos,
                 vel,
@@ -2027,6 +2298,10 @@ enum HubEvent {
         player_uid: u64,
         reply_tx: tokio::sync::oneshot::Sender<NetServerMsg>,
     },
+    DeleteCharacterQuery {
+        req: NetClientMsg,
+        reply_tx: tokio::sync::oneshot::Sender<NetServerMsg>,
+    },
     PeerConnected {
         hello: NetClientMsg,
         tx: tokio::sync::mpsc::UnboundedSender<NetServerMsg>,
@@ -2117,6 +2392,22 @@ pub async fn run_server_on_listener(
                     if h_tx
                         .send(HubEvent::ProbeQuery {
                             player_uid,
+                            reply_tx: rep_tx,
+                        })
+                        .is_ok()
+                    {
+                        if let Ok(reply) = rep_rx.await {
+                            let _ = write_packet(&mut wr, &reply).await;
+                            let _ = tokio::io::AsyncWriteExt::flush(&mut wr).await;
+                        }
+                    }
+                    return;
+                }
+                if matches!(first_msg, NetClientMsg::DeleteServerCharacter { .. }) {
+                    let (rep_tx, rep_rx) = tokio::sync::oneshot::channel::<NetServerMsg>();
+                    if h_tx
+                        .send(HubEvent::DeleteCharacterQuery {
+                            req: first_msg,
                             reply_tx: rep_tx,
                         })
                         .is_ok()
@@ -2260,6 +2551,87 @@ fn process_hub_event(
                 existing_character,
             });
         }
+        HubEvent::DeleteCharacterQuery { req, reply_tx } => {
+            if let NetClientMsg::DeleteServerCharacter {
+                protocol_version,
+                player_uid,
+                password,
+                pubkey,
+                auth_timestamp_ms,
+                sig_r,
+                sig_s,
+            } = req
+            {
+                if protocol_version != PROTOCOL_VERSION {
+                    let _ = reply_tx.send(NetServerMsg::CharacterDeleteReply {
+                        ok: false,
+                        deleted_name: String::new(),
+                        message: format!(
+                            "Protokoll-Version inkompatibel (Server v{}, Client v{})",
+                            PROTOCOL_VERSION, protocol_version
+                        ),
+                    });
+                    return true;
+                }
+                if !hub.config.password.is_empty() && password != hub.config.password {
+                    let _ = reply_tx.send(NetServerMsg::CharacterDeleteReply {
+                        ok: false,
+                        deleted_name: String::new(),
+                        message: "Falsches Server-Passwort!".to_string(),
+                    });
+                    return true;
+                }
+                if let Err(err) = hub.verify_and_bind_uid(
+                    player_uid,
+                    &pubkey,
+                    AUTH_ACTION_DELETE_CHAR,
+                    auth_timestamp_ms,
+                    &sig_r,
+                    &sig_s,
+                ) {
+                    let _ = reply_tx.send(NetServerMsg::CharacterDeleteReply {
+                        ok: false,
+                        deleted_name: String::new(),
+                        message: err,
+                    });
+                    return true;
+                }
+                let Some(deleted_name) = hub
+                    .characters
+                    .get(&player_uid)
+                    .map(|c| c.player_name.clone())
+                else {
+                    let _ = reply_tx.send(NetServerMsg::CharacterDeleteReply {
+                        ok: false,
+                        deleted_name: String::new(),
+                        message: "Kein gespeicherter Charakter auf diesem Server gefunden."
+                            .to_string(),
+                    });
+                    return true;
+                };
+                if hub.peers.contains_key(&player_uid) {
+                    hub.handle_disconnect(player_uid);
+                    online_count.store(hub.peers.len(), Ordering::Relaxed);
+                }
+                hub.purge_character_for_reset(player_uid);
+                hub.save_if_needed(true);
+                hub.publish_macro_sync();
+                if hub.config.is_dedicated {
+                    println!(
+                        "[DDNeo-Server] Charakter '{}' (UID {}) per Ed25519-Signatur gelöscht.",
+                        deleted_name, player_uid
+                    );
+                }
+                let _ = reply_tx.send(NetServerMsg::CharacterDeleteReply {
+                    ok: true,
+                    deleted_name: deleted_name.clone(),
+                    message: format!(
+                        "Charakter '{}' wurde erfolgreich auf Server '{}' gelöscht.",
+                        deleted_name, hub.config.session_name
+                    ),
+                });
+            }
+        }
         HubEvent::PeerConnected {
             hello,
             tx,
@@ -2275,6 +2647,10 @@ fn process_hub_event(
                 appearance_bytes,
                 net_pos,
                 reset_character,
+                pubkey,
+                auth_timestamp_ms,
+                sig_r,
+                sig_s,
             } = hello
             {
                 if protocol_version != PROTOCOL_VERSION {
@@ -2291,6 +2667,18 @@ fn process_hub_event(
                     let _ = tx.send(NetServerMsg::Rejected {
                         reason: "Falsches Server-Passwort!".to_string(),
                     });
+                    let _ = accept_tx.send(false);
+                    return true;
+                }
+                if let Err(err) = hub.verify_and_bind_uid(
+                    player_uid,
+                    &pubkey,
+                    AUTH_ACTION_HELLO,
+                    auth_timestamp_ms,
+                    &sig_r,
+                    &sig_s,
+                ) {
+                    let _ = tx.send(NetServerMsg::Rejected { reason: err });
                     let _ = accept_tx.send(false);
                     return true;
                 }
@@ -2558,7 +2946,10 @@ mod tests {
             ingame_day_real_secs: 1440.0,
         };
 
-        // 1. Start Dedicated Server #1, connect a player, found a guild + seal portal 999, then shut down!
+        let owner_seed = [0x42u8; 32];
+        let attacker_seed = [0x99u8; 32];
+
+        // 1. Start Dedicated Server #1, connect a player with Ed25519 signature, found a guild + seal portal 999, then shut down!
         let first_seed;
         {
             let mut srv1 = RunningServerHandle::start(cfg.clone()).expect("Server 1 bind");
@@ -2571,6 +2962,9 @@ mod tests {
             first_seed = rt.block_on(async {
                 let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let (mut rd, mut wr) = stream.into_split();
+                let ts = current_unix_ms();
+                let (pubkey, sig_r, sig_s) =
+                    sign_auth_action(&owner_seed, AUTH_ACTION_HELLO, 555, ts);
                 write_packet(
                     &mut wr,
                     &NetClientMsg::Hello {
@@ -2586,6 +2980,10 @@ mod tests {
                             merc_y: 6_894_000.0,
                         },
                         reset_character: false,
+                        pubkey,
+                        auth_timestamp_ms: ts,
+                        sig_r,
+                        sig_s,
                     },
                 )
                 .await
@@ -2671,7 +3069,7 @@ mod tests {
         assert!(world_file.exists(), "server_world.bin must exist after shutdown");
         assert!(status_file.exists(), "server_status.json must exist");
 
-        // 2. Reboot Dedicated Server #2 from the saved file -> verify guild, base, seed & sealed portal survived!
+        // 2. Reboot Dedicated Server #2 -> verify guild, base, seed, sealed portal, spoof protection & signed character deletion!
         {
             let mut srv2 = RunningServerHandle::start(cfg).expect("Server 2 bind");
             let addr = srv2.bound_addr;
@@ -2680,48 +3078,182 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-                let (mut rd, mut wr) = stream.into_split();
-                write_packet(
-                    &mut wr,
-                    &NetClientMsg::Hello {
-                        protocol_version: PROTOCOL_VERSION,
-                        player_uid: 555,
-                        name: "VpsFounder".to_string(),
-                        password: String::new(),
-                        level: 14,
-                        role_id: 0,
-                        appearance_bytes: [7u8; 24],
-                        net_pos: NetWorldPos::Overworld {
-                            merc_x: 1_492_000.0,
-                            merc_y: 6_894_000.0,
+                // 2a. Attacker with different Ed25519 key attempting to hijack UID 555 MUST be rejected!
+                {
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let ts = current_unix_ms();
+                    let (atk_pk, atk_r, atk_s) =
+                        sign_auth_action(&attacker_seed, AUTH_ACTION_HELLO, 555, ts);
+                    write_packet(
+                        &mut wr,
+                        &NetClientMsg::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            player_uid: 555,
+                            name: "Spoofer".to_string(),
+                            password: String::new(),
+                            level: 99,
+                            role_id: 0,
+                            appearance_bytes: [0u8; 24],
+                            net_pos: NetWorldPos::default(),
+                            reset_character: false,
+                            pubkey: atk_pk,
+                            auth_timestamp_ms: ts,
+                            sig_r: atk_r,
+                            sig_s: atk_s,
                         },
-                        reset_character: false,
-                    },
-                )
-                .await
-                .unwrap();
+                    )
+                    .await
+                    .unwrap();
+                    let rej = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
+                    assert!(
+                        matches!(rej, NetServerMsg::Rejected { .. }),
+                        "Spoofed Hello with wrong Ed25519 key must be rejected!"
+                    );
+                }
 
-                let welcome = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
-                match welcome {
-                    NetServerMsg::Welcome {
-                        world_seed,
-                        assigned_guild_id,
-                        assigned_guild_role,
-                        sealed_portals,
-                        saved_character,
-                        ..
-                    } => {
-                        assert_eq!(world_seed, first_seed, "World seed must persist across VPS reboot");
-                        assert_eq!(assigned_guild_id, Some(1), "Guild membership must persist");
-                        assert_eq!(assigned_guild_role, PlayerGuildRole::Founder);
-                        assert!(sealed_portals.contains(&999), "Sealed portals must persist");
-                        let sc = saved_character
-                            .expect("Server-stored online character must be returned on reconnect");
-                        assert_eq!(sc.level, 7);
-                        assert_eq!(sc.character_bincode, vec![42, 99, 101]);
+                // 2b. Attacker attempting signed DeleteServerCharacter on UID 555 MUST fail!
+                {
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let ts = current_unix_ms();
+                    let (atk_pk, atk_r, atk_s) =
+                        sign_auth_action(&attacker_seed, AUTH_ACTION_DELETE_CHAR, 555, ts);
+                    write_packet(
+                        &mut wr,
+                        &NetClientMsg::DeleteServerCharacter {
+                            protocol_version: PROTOCOL_VERSION,
+                            player_uid: 555,
+                            password: String::new(),
+                            pubkey: atk_pk,
+                            auth_timestamp_ms: ts,
+                            sig_r: atk_r,
+                            sig_s: atk_s,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let rep = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
+                    match rep {
+                        NetServerMsg::CharacterDeleteReply { ok, .. } => {
+                            assert!(!ok, "Spoofed DeleteServerCharacter must be rejected!");
+                        }
+                        other => panic!("Expected CharacterDeleteReply, got {:?}", other),
                     }
-                    other => panic!("Expected Welcome on reboot, got {:?}", other),
+                }
+
+                // 2c. Legitimate owner reconnects -> receives full persisted character & guild!
+                {
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let ts = current_unix_ms();
+                    let (pubkey, sig_r, sig_s) =
+                        sign_auth_action(&owner_seed, AUTH_ACTION_HELLO, 555, ts);
+                    write_packet(
+                        &mut wr,
+                        &NetClientMsg::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            player_uid: 555,
+                            name: "VpsFounder".to_string(),
+                            password: String::new(),
+                            level: 14,
+                            role_id: 0,
+                            appearance_bytes: [7u8; 24],
+                            net_pos: NetWorldPos::Overworld {
+                                merc_x: 1_492_000.0,
+                                merc_y: 6_894_000.0,
+                            },
+                            reset_character: false,
+                            pubkey,
+                            auth_timestamp_ms: ts,
+                            sig_r,
+                            sig_s,
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    let welcome = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
+                    match welcome {
+                        NetServerMsg::Welcome {
+                            world_seed,
+                            assigned_guild_id,
+                            assigned_guild_role,
+                            sealed_portals,
+                            saved_character,
+                            ..
+                        } => {
+                            assert_eq!(world_seed, first_seed, "World seed must persist across VPS reboot");
+                            assert_eq!(assigned_guild_id, Some(1), "Guild membership must persist");
+                            assert_eq!(assigned_guild_role, PlayerGuildRole::Founder);
+                            assert!(sealed_portals.contains(&999), "Sealed portals must persist");
+                            let sc = saved_character
+                                .expect("Server-stored online character must be returned on reconnect");
+                            assert_eq!(sc.level, 7);
+                            assert_eq!(sc.character_bincode, vec![42, 99, 101]);
+                        }
+                        other => panic!("Expected Welcome on reboot, got {:?}", other),
+                    }
+                }
+
+                // 2d. Legitimate owner sends signed DeleteServerCharacter from Character Manager -> character & guild purged!
+                {
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let ts = current_unix_ms();
+                    let (pubkey, sig_r, sig_s) =
+                        sign_auth_action(&owner_seed, AUTH_ACTION_DELETE_CHAR, 555, ts);
+                    write_packet(
+                        &mut wr,
+                        &NetClientMsg::DeleteServerCharacter {
+                            protocol_version: PROTOCOL_VERSION,
+                            player_uid: 555,
+                            password: String::new(),
+                            pubkey,
+                            auth_timestamp_ms: ts,
+                            sig_r,
+                            sig_s,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let rep = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
+                    match rep {
+                        NetServerMsg::CharacterDeleteReply {
+                            ok, deleted_name, ..
+                        } => {
+                            assert!(ok, "Valid owner signature must delete character");
+                            assert_eq!(deleted_name, "VpsFounder");
+                        }
+                        other => panic!("Expected CharacterDeleteReply, got {:?}", other),
+                    }
+                }
+
+                // 2e. ProbeServer confirms character 555 is now None!
+                {
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let (mut rd, mut wr) = stream.into_split();
+                    write_packet(
+                        &mut wr,
+                        &NetClientMsg::ProbeServer {
+                            protocol_version: PROTOCOL_VERSION,
+                            player_uid: 555,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let probe = read_packet::<NetServerMsg>(&mut rd).await.unwrap();
+                    match probe {
+                        NetServerMsg::ServerProbeReply {
+                            existing_character, ..
+                        } => {
+                            assert!(
+                                existing_character.is_none(),
+                                "Deleted server character must no longer appear in ProbeServer"
+                            );
+                        }
+                        other => panic!("Expected ServerProbeReply, got {:?}", other),
+                    }
                 }
             });
             srv2.shutdown();
